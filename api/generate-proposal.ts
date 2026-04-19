@@ -107,7 +107,12 @@ const BAD_TYPES = new Set([
   'country', 'postal_code', 'political', 'route', 'street_address',
 ])
 
-async function placesTextSearch(query: string, apiKey: string): Promise<PlaceMatch | null> {
+async function placesTextSearch(
+  query: string,
+  apiKey: string,
+  opts: { strict?: boolean } = {}
+): Promise<PlaceMatch | null> {
+  const { strict = true } = opts
   try {
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
@@ -128,14 +133,17 @@ async function placesTextSearch(query: string, apiKey: string): Promise<PlaceMat
     const places = (data.places || []) as any[]
     if (!places.length) return null
 
-    // Pick the first place that is not a neighborhood/locality
-    const good = places.find((p) => {
-      const type = p.primaryType || ''
-      const types = p.types || []
-      if (BAD_TYPES.has(type)) return false
-      if (types.some((t: string) => BAD_TYPES.has(t))) return false
-      return true
-    })
+    // strict=true: filter out locality/neighborhood/country (for gastronomía/actividades)
+    // strict=false: accept anything (for destination hero — country/city photos are fine)
+    const good = strict
+      ? places.find((p) => {
+          const type = p.primaryType || ''
+          const types = p.types || []
+          if (BAD_TYPES.has(type)) return false
+          if (types.some((t: string) => BAD_TYPES.has(t))) return false
+          return true
+        })
+      : places[0]
     if (!good) return null
 
     return {
@@ -152,6 +160,37 @@ async function placesTextSearch(query: string, apiKey: string): Promise<PlaceMat
     console.error(`[Places] fetch threw for "${query}":`, e.message)
     return null
   }
+}
+
+// Hero image for the whole trip: search the destination on Places and download its top photo.
+// This fixes the problem of Claude inventing Unsplash photo IDs that return 404.
+async function fetchDestinationHero(
+  destino: string,
+  pais: string | null,
+  apiKey: string,
+  supaAdmin: SupabaseClient
+): Promise<string | null> {
+  const query = pais && !destino.toLowerCase().includes(pais.toLowerCase())
+    ? `${destino} ${pais}`
+    : destino
+
+  const match = await placesTextSearch(query, apiKey, { strict: false })
+  if (!match) {
+    console.warn(`[Hero] Places returned no match for destino "${query}"`)
+    return null
+  }
+  if (!match.photoName || !match.placeId) {
+    console.warn(`[Hero] Places match for "${query}" has no photo`)
+    return null
+  }
+
+  const url = await fetchAndStorePhoto(match.photoName, `hero-${match.placeId}`, apiKey, supaAdmin)
+  if (!url) {
+    console.warn(`[Hero] Photo download failed for "${query}"`)
+    return null
+  }
+  console.log(`[Hero] ${destino} → ${match.name} (${match.primaryType})`)
+  return url
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -605,7 +644,9 @@ export default async function handler(req: any, res: any) {
     if (placesEnabled && supaAdmin) {
       const city = viaje.destino
       try {
-        const [gastroResult, actResult] = await Promise.all([
+        // Run hero lookup in parallel with gastro + actividades enrichment
+        const [heroUrl, gastroResult, actResult] = await Promise.all([
+          fetchDestinationHero(viaje.destino, viaje.pais, PLACES_KEY!, supaAdmin),
           Array.isArray(json.gastronomia)
             ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
@@ -613,7 +654,10 @@ export default async function handler(req: any, res: any) {
             ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
         ])
-        enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
+        if (heroUrl) {
+          json.cover_img = heroUrl
+        }
+        enrichmentSummary = `hero ${heroUrl ? '✓' : '✗'}; gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
         console.log(`[Enrichment] ${enrichmentSummary}`)
       } catch (e: any) {
         console.error('[Enrichment] unexpected error (continuing without it):', e.message)
