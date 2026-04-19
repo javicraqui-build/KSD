@@ -126,14 +126,10 @@ REGLAS ESTRICTAS:
 - Todo en castellano neutro.${viaje.intencion ? '\n- AJUSTÁ todas las recomendaciones al CONTEXTO ESPECÍFICO. Si mencionan teletrabajo, alojamiento con buen WiFi y espacio de trabajo. Si es luna de miel, rincones románticos. Si es mochileros, presupuesto bajo. Si hay niños, actividades familiares. Etc.' : ''}`
 }
 
-// Parser robusto: aguanta preámbulos, markdown fences, etc.
 function extractJson(text: string): any {
   const attempts: Array<() => any> = [
-    // 1 · Parse directo (Claude obedeció las reglas)
     () => JSON.parse(text.trim()),
-    // 2 · Strippeá markdown fences
     () => JSON.parse(text.replace(/```json\s*|```\s*/g, '').trim()),
-    // 3 · Extraé desde el primer { hasta el último }
     () => {
       const first = text.indexOf('{')
       const last = text.lastIndexOf('}')
@@ -153,30 +149,24 @@ function extractJson(text: string): any {
   throw lastErr || new Error('Unknown parse error')
 }
 
-export default async function handler(req: Request): Promise<Response> {
+// Node-style Vercel handler (req, res)
+export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 })
+    return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  // Chequeos de env al inicio (errores claros si falta algo)
   if (!process.env.ANTHROPIC_API_KEY) {
-    return Response.json(
-      { error: 'ANTHROPIC_API_KEY no configurada en Vercel' },
-      { status: 500 }
-    )
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada en Vercel' })
   }
   if (!process.env.VITE_SUPABASE_URL || !process.env.VITE_SUPABASE_ANON_KEY) {
-    return Response.json(
-      { error: 'VITE_SUPABASE_URL o VITE_SUPABASE_ANON_KEY no configuradas en Vercel' },
-      { status: 500 }
-    )
+    return res.status(500).json({ error: 'VITE_SUPABASE_URL o VITE_SUPABASE_ANON_KEY no configuradas en Vercel' })
   }
 
   try {
-    // Auth
-    const authHeader = req.headers.get('authorization')
-    if (!authHeader?.startsWith('Bearer ')) {
-      return Response.json({ error: 'Unauthorized' }, { status: 401 })
+    // Auth: header se lee como objeto plano en Node runtime
+    const authHeader = req.headers.authorization || req.headers.Authorization
+    if (!authHeader || typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ error: 'Unauthorized' })
     }
     const token = authHeader.slice(7)
 
@@ -189,21 +179,18 @@ export default async function handler(req: Request): Promise<Response> {
     const {
       data: { user },
     } = await supabase.auth.getUser(token)
-    if (!user) return Response.json({ error: 'Unauthorized (invalid token)' }, { status: 401 })
+    if (!user) return res.status(401).json({ error: 'Unauthorized (invalid token)' })
 
     const { data: allowed, error: allowErr } = await supabase.rpc('is_ksd_user')
     if (allowErr) {
-      return Response.json(
-        { error: 'Error checking allowlist', detail: allowErr.message },
-        { status: 500 }
-      )
+      return res.status(500).json({ error: 'Error checking allowlist', detail: allowErr.message })
     }
-    if (!allowed) return Response.json({ error: 'Forbidden (not in allowlist)' }, { status: 403 })
+    if (!allowed) return res.status(403).json({ error: 'Forbidden (not in allowlist)' })
 
-    // Body
-    const body = await req.json().catch(() => null)
+    // Body — Vercel Node parsea JSON automáticamente
+    const body = req.body
     const viaje_id = body?.viaje_id
-    if (!viaje_id) return Response.json({ error: 'viaje_id required' }, { status: 400 })
+    if (!viaje_id) return res.status(400).json({ error: 'viaje_id required' })
 
     // Fetch viaje
     const { data: viaje, error: vErr } = await supabase
@@ -213,15 +200,13 @@ export default async function handler(req: Request): Promise<Response> {
       .single()
 
     if (vErr || !viaje) {
-      return Response.json(
-        { error: 'Viaje not found', detail: vErr?.message },
-        { status: 404 }
-      )
+      return res.status(404).json({ error: 'Viaje not found', detail: vErr?.message })
     }
 
     const personas = (viaje.viajeros as any[]).map((v: any) => v.personas).filter(Boolean)
-    if (personas.length === 0)
-      return Response.json({ error: 'El viaje no tiene viajeros asignados' }, { status: 400 })
+    if (personas.length === 0) {
+      return res.status(400).json({ error: 'El viaje no tiene viajeros asignados' })
+    }
 
     // Call Claude
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
@@ -236,23 +221,17 @@ export default async function handler(req: Request): Promise<Response> {
       })
     } catch (apiErr: any) {
       console.error('Anthropic API error:', apiErr)
-      return Response.json(
-        {
-          error: 'Anthropic API error',
-          detail: apiErr.message || String(apiErr),
-          status: apiErr.status,
-          model_used: MODEL,
-        },
-        { status: 502 }
-      )
+      return res.status(502).json({
+        error: 'Anthropic API error',
+        detail: apiErr.message || String(apiErr),
+        status: apiErr.status,
+        model_used: MODEL,
+      })
     }
 
     const textBlock = msg.content.find((c: any) => c.type === 'text') as any
     if (!textBlock?.text) {
-      return Response.json(
-        { error: 'Claude returned no text', raw: JSON.stringify(msg).slice(0, 500) },
-        { status: 500 }
-      )
+      return res.status(500).json({ error: 'Claude returned no text', raw: JSON.stringify(msg).slice(0, 500) })
     }
 
     let json: any
@@ -260,14 +239,11 @@ export default async function handler(req: Request): Promise<Response> {
       json = extractJson(textBlock.text)
     } catch (e: any) {
       console.error('JSON parse failed. Raw:', textBlock.text.slice(0, 2000))
-      return Response.json(
-        {
-          error: 'AI response malformed',
-          detail: e.message,
-          raw: textBlock.text.slice(0, 800),
-        },
-        { status: 500 }
-      )
+      return res.status(500).json({
+        error: 'AI response malformed',
+        detail: e.message,
+        raw: textBlock.text.slice(0, 800),
+      })
     }
 
     const noches = Math.max(
@@ -288,13 +264,10 @@ export default async function handler(req: Request): Promise<Response> {
       })
       .eq('id', viaje_id)
     if (upErr) {
-      return Response.json(
-        { error: 'Error actualizando viaje', detail: upErr.message },
-        { status: 500 }
-      )
+      return res.status(500).json({ error: 'Error actualizando viaje', detail: upErr.message })
     }
 
-    // Clear existing children
+    // Clear existing children (para regeneraciones)
     await Promise.all([
       supabase.from('transporte').delete().eq('viaje_id', viaje_id),
       supabase.from('alojamientos').delete().eq('viaje_id', viaje_id),
@@ -330,22 +303,16 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (errors.length) {
-      return Response.json(
-        { error: 'Errores insertando en DB', details: errors },
-        { status: 500 }
-      )
+      return res.status(500).json({ error: 'Errores insertando en DB', details: errors })
     }
 
-    return Response.json({ success: true, viaje_id })
+    return res.status(200).json({ success: true, viaje_id })
   } catch (err: any) {
     console.error('Generate proposal error:', err)
-    return Response.json(
-      {
-        error: 'Error inesperado',
-        detail: err.message || String(err),
-        stack: err.stack?.split('\n').slice(0, 5).join('\n'),
-      },
-      { status: 500 }
-    )
+    return res.status(500).json({
+      error: 'Error inesperado',
+      detail: err.message || String(err),
+      stack: err.stack?.split('\n').slice(0, 5).join('\n'),
+    })
   }
 }
