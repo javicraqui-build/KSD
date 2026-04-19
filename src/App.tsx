@@ -592,7 +592,7 @@ function PersonaView({ id, state, onSave, onDelete, onNavigate }: any) {
 function NuevoViajeView({ state, onCreate, onNavigate }: any) {
   const [step, setStep] = useState(1)
   const [draft, setDraft] = useState<any>({
-    titulo: '', destino: '', pais: '', fecha_inicio: '', fecha_fin: '',
+    titulo: '', origen: 'Madrid', destino: '', pais: '', fecha_inicio: '', fecha_fin: '',
     viajeros: state.personas.map((p: Persona) => p.id),
     presupuesto_total: 2000, estado: 'idea', cover_img: ''
   })
@@ -671,6 +671,15 @@ function NuevoViajeView({ state, onCreate, onNavigate }: any) {
             onChange={e => setDraft({ ...draft, destino: e.target.value, pais: '' })}
             className="w-full bg-transparent border-b pb-3 font-serif text-3xl"
             style={{ borderColor: C.line, color: C.ink }} placeholder="Tokio, Marrakech, un pueblo de los Alpes…" />
+
+          <div className="flex items-baseline gap-4 pt-8">
+            <span className="tracking-caps-sm whitespace-nowrap" style={{ color: C.muted }}>Salís desde</span>
+            <input type="text" value={draft.origen}
+              onChange={e => setDraft({ ...draft, origen: e.target.value })}
+              className="flex-1 bg-transparent border-b pb-1 font-serif text-xl"
+              style={{ borderColor: C.line, color: C.ink }}
+              placeholder="Madrid" />
+          </div>
         </div>
       )}
 

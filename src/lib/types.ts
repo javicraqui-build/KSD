@@ -94,6 +94,7 @@ export type Gastronomia = {
 export type Viaje = {
   id: string
   titulo: string
+  origen: string
   destino: string
   pais: string | null
   fecha_inicio: string | null

@@ -8,7 +8,9 @@ export const config = {
 
 const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5'
 
-const SYSTEM = `Sos un concierge de viajes con sensibilidad editorial — voz cálida, específica, evocadora. Tu output es SIEMPRE un JSON válido sin texto adicional, sin markdown fences, sin explicaciones.`
+const SYSTEM = `Sos un concierge de viajes con sensibilidad editorial — voz cálida, específica, evocadora. Tu output es SIEMPRE un JSON válido sin texto adicional, sin markdown fences, sin explicaciones.
+
+Sos un modelo de lenguaje, NO una base de datos en tiempo real de vuelos, hoteles o restaurantes. Tu trabajo es CURAR EL ESTILO del viaje y guiar al usuario a búsquedas reales via deeplinks. NUNCA inventes nombres específicos que suenan plausibles pero no existen. Si no tenés 100% de certeza de que algo existe con un nombre exacto, usá un nombre DESCRIPTIVO del perfil y dejá campos factuales (rating, número de vuelo) en null. El deeplink lleva al usuario a una búsqueda real — ahí ve opciones concretas.`
 
 function buildPrompt(viaje: any, personas: any[]): string {
   const noches = Math.max(
@@ -17,6 +19,8 @@ function buildPrompt(viaje: any, personas: any[]): string {
       (new Date(viaje.fecha_fin).getTime() - new Date(viaje.fecha_inicio).getTime()) / 86400000
     )
   )
+
+  const origen = viaje.origen || 'Madrid'
 
   const personasDesc = personas
     .map((p) => {
@@ -37,11 +41,66 @@ function buildPrompt(viaje: any, personas: any[]): string {
 
   return `Armá una propuesta de viaje completa para:
 
+ORIGEN: ${origen}
 DESTINO: ${viaje.destino}${viaje.pais ? `, ${viaje.pais}` : ''}
 FECHAS: ${viaje.fecha_inicio} al ${viaje.fecha_fin} (${noches} noches)
 PRESUPUESTO TOTAL ORIENTATIVO: ${viaje.presupuesto_total}€
 VIAJEROS (${personas.length} personas):
 ${personasDesc}${intencionBlock}
+
+═══════════════════════════════════════════════════════════
+REGLAS DE HONESTIDAD (CRÍTICAS — NUNCA VIOLES ESTO)
+═══════════════════════════════════════════════════════════
+
+No sabés horarios reales del día de hoy, ni números de vuelo actuales, ni inventarios específicos de hoteles/restaurantes. Seguí estas reglas al pie de la letra:
+
+1) TRANSPORTE (vuelos):
+   • numero_ida y numero_vuelta: SIEMPRE null. No inventes números de vuelo.
+   • compania: poné aerolíneas TÍPICAS DE LA RUTA (ej. ${origen}→${viaje.destino}: las aerolíneas que realmente vuelan esa ruta).
+   • hora_ida_salida / hora_ida_llegada / hora_vuelta_*: horarios ESTIMATIVOS realistas para esa ruta. Ponelo claro en "highlights" que es orientativo.
+   • precio: promedio razonable para esa ruta y temporada.
+   • duracion: la duración real típica del vuelo directo de esa ruta.
+   • El deeplink de Skyscanner es el HÉROE — ahí el usuario verá vuelos reales.
+
+2) ALOJAMIENTO — dos opciones para el campo "nombre":
+   A) Si conocés un alojamiento ICÓNICO, específico y verificable del destino (ej. Memmo Alfama en Lisboa, Belmond Reid's Palace en Madeira): ponlo con su nombre real, rating y reviews coherentes.
+   B) Si no tenés 100% certeza: usá un NOMBRE DESCRIPTIVO DEL PERFIL. En ese caso "rating": null y "reviews": null.
+      Ejemplos válidos para opción B:
+       - "Apartamento boutique en Alfama"
+       - "Casa tradicional con patio en Graça"
+       - "Hotel de diseño en Príncipe Real"
+       - "Quinta rural con piscina a 20min de Óbidos"
+   NUNCA inventes nombres específicos plausibles que no existen (ej. "Hotel Belvedere Lisboa", "Casa do Fado Suites"). Si dudás, usá opción B.
+   El deeplink a Booking/Airbnb lleva a búsqueda filtrada por barrio+fechas → el usuario elige resultados reales.
+
+3) GASTRONOMÍA — mismas dos opciones:
+   A) Restaurantes icónicos y famosos (ej. Cervejaria Ramiro en Lisboa, Bouillon Chartier en París, Casa Lucio en Madrid): nombre real + rating realista.
+   B) Si no: nombre DESCRIPTIVO del perfil. rating: null.
+      Ejemplos válidos para opción B:
+       - "Tasca tradicional con fado en Alfama"
+       - "Marisquería de barrio en Cascais"
+       - "Bistró orgánico en Príncipe Real"
+       - "Pastelería histórica en Belém"
+   NUNCA inventes un restaurante concreto con nombre propio si no estás segura de que existe.
+   El deeplink a Google Maps con ese nombre descriptivo + ciudad muestra restaurantes reales coincidentes.
+
+4) ACTIVIDADES:
+   • Museos, monumentos, miradores, barrios, parques y atracciones fijas: SÍ podés nombrar — existen y son estables (Castelo de São Jorge, Torre de Belém, Museu Nacional do Azulejo, Elevador de Santa Justa, barrio de Alfama).
+   • Tours, experiencias guiadas, talleres: describí el TIPO sin nombrar empresas o productos comerciales.
+      Ejemplos válidos:
+       - "Free walking tour por Alfama al atardecer"
+       - "Tour de fado por tascas tradicionales"
+       - "Clase de pastéis de nata con chef local"
+       - "Excursión en velero por la costa de Cascais"
+   • El deeplink a GetYourGuide/Civitatis con búsqueda pre-rellenada muestra tours reales.
+
+REGLA FINAL — EL TEST DEL CLICK:
+El usuario va a clickear cada deeplink. Si clickea y el lugar/vuelo/tour NO EXISTE con ese nombre, perdimos su confianza. Mejor ser descriptivo y llevarlo a una búsqueda real que inventar un nombre plausible. La IA cura el ESTILO, las búsquedas dan los DATOS.
+
+═══════════════════════════════════════════════════════════
+ESTRUCTURA DE SALIDA (JSON estricto)
+═══════════════════════════════════════════════════════════
+
 Devolvé un JSON con ESTA estructura exacta:
 
 {
@@ -51,10 +110,10 @@ Devolvé un JSON con ESTA estructura exacta:
   "transporte": [
     {
       "compania": "TAP Air Portugal",
-      "numero_ida": "TP1017",
-      "numero_vuelta": "TP1022",
-      "origen": "MAD",
-      "destino": "código IATA 3 letras",
+      "numero_ida": null,
+      "numero_vuelta": null,
+      "origen": "código IATA del aeropuerto principal del ORIGEN (ej. ${origen} → deducir IATA)",
+      "destino": "código IATA 3 letras del destino",
       "fecha_ida": "${viaje.fecha_inicio}",
       "hora_ida_salida": "10:15",
       "hora_ida_llegada": "10:45",
@@ -63,21 +122,21 @@ Devolvé un JSON con ESTA estructura exacta:
       "hora_vuelta_llegada": "21:00",
       "precio": 284,
       "duracion": "2h 30m",
-      "highlights": ["3 beneficios cortos"],
-      "deeplink": "URL real a la aerolínea o Skyscanner",
+      "highlights": ["Horarios orientativos", "Vuelo directo", "Equipaje de mano incluido"],
+      "deeplink": "URL de Skyscanner con parámetros",
       "seleccionado": true
     }
   ],
   "alojamientos": [
     {
       "plataforma": "Booking o Airbnb",
-      "nombre": "Nombre del lugar",
+      "nombre": "Nombre real si icónico, o descriptivo del perfil",
       "barrio": "Barrio",
       "tipo": "Hotel boutique / Apartamento entero / Casa de huéspedes",
       "precio_noche": 215,
-      "rating": 9.2,
-      "reviews": 1247,
-      "highlights": ["4 highlights"],
+      "rating": null,
+      "reviews": null,
+      "highlights": ["4 características reales del perfil (barrio, estilo, servicios)"],
       "img": "URL Unsplash",
       "deeplink": "https://www.booking.com/searchresults.html?ss=...",
       "seleccionado": true
@@ -85,7 +144,7 @@ Devolvé un JSON con ESTA estructura exacta:
   ],
   "actividades": [
     {
-      "nombre": "Actividad",
+      "nombre": "Nombre del lugar fijo (monumento, museo) o tipo de experiencia",
       "tipo": "Monumento / Experiencia / Patrimonio / Excursión / Paseo libre / Museo",
       "dia": 1,
       "duracion": "2-3h",
@@ -93,70 +152,76 @@ Devolvé un JSON con ESTA estructura exacta:
       "descripcion": "1-2 oraciones evocadoras con detalles específicos",
       "plataforma": "Civitatis / GetYourGuide / Entrada oficial / Sin reserva",
       "img": "URL Unsplash",
-      "deeplink": "URL real",
+      "deeplink": "URL real con búsqueda",
       "seleccionado": true
     }
   ],
   "gastronomia": [
     {
-      "nombre": "Restaurante",
+      "nombre": "Nombre real si icónico, o descriptivo del perfil",
       "tipo_cocina": "Tipo",
       "barrio": "Barrio",
       "precio_rango": "€€€",
-      "rating": 4.6,
+      "rating": null,
       "dia_sugerido": 1,
       "descripcion": "Mencioná el plato icónico o la vibra — no genericidades",
       "img": "URL Unsplash",
-      "deeplink": "https://www.google.com/maps/search/?api=1&query=Nombre+Restaurante+${viaje.destino}",
+      "deeplink": "https://www.google.com/maps/search/?api=1&query=Nombre+descriptivo+${viaje.destino}",
       "seleccionado": true
     }
   ]
 }
 
-REGLAS ESTRICTAS:
-REGLAS DE DEEPLINKS (CRÍTICO — NUNCA uses URLs genéricas sin parámetros):
+═══════════════════════════════════════════════════════════
+REGLAS DE DEEPLINKS (CRÍTICO — NUNCA uses URLs genéricas sin parámetros)
+═══════════════════════════════════════════════════════════
 
-Vuelos → SIEMPRE Skyscanner con todos los parámetros, sin importar la aerolínea:
+VUELOS → SIEMPRE Skyscanner con todos los parámetros:
   https://www.skyscanner.net/transport/flights/{iata_origen_lower}/{iata_destino_lower}/{YYMMDD_ida}/{YYMMDD_vuelta}/?adults={n}
   Ejemplo: https://www.skyscanner.net/transport/flights/mad/lis/260715/260815/?adults=2
-  NO uses URLs tipo flytap.com o ryanair.com sin parámetros.
+  NO uses flytap.com, ryanair.com ni homepages sin parámetros.
 
-Alojamiento Booking → búsqueda con fechas y huéspedes:
-  https://www.booking.com/searchresults.html?ss={hotel+ciudad}&checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&group_adults={n}
-  Ejemplo: https://www.booking.com/searchresults.html?ss=Memmo+Alfama+Lisboa&checkin=2026-05-15&checkout=2026-05-20&group_adults=2
+ALOJAMIENTO BOOKING → búsqueda con fechas y huéspedes:
+  https://www.booking.com/searchresults.html?ss={nombre_o_barrio+ciudad}&checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&group_adults={n}
+  Ejemplo icónico: https://www.booking.com/searchresults.html?ss=Memmo+Alfama+Lisboa&checkin=2026-05-15&checkout=2026-05-20&group_adults=2
+  Ejemplo perfil: https://www.booking.com/searchresults.html?ss=Alfama+Lisboa+boutique&checkin=2026-05-15&checkout=2026-05-20&group_adults=2
 
-Alojamiento Airbnb → búsqueda pre-rellenada:
+ALOJAMIENTO AIRBNB → búsqueda pre-rellenada:
   https://www.airbnb.com/s/{ciudad--barrio}/homes?checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&adults={n}
   Ejemplo: https://www.airbnb.com/s/Lisboa--Principe-Real/homes?checkin=2026-05-15&checkout=2026-05-20&adults=2
 
-Actividades Civitatis → búsqueda específica de esa actividad en la ciudad:
+ACTIVIDADES CIVITATIS → búsqueda específica:
   https://www.civitatis.com/es/{ciudad-slug}/?q={busqueda}
   Ejemplo: https://www.civitatis.com/es/lisboa/?q=fado+alfama
   NO uses URL genérica tipo https://www.civitatis.com/es/lisboa/
 
-Actividades GetYourGuide → búsqueda:
+ACTIVIDADES GETYOURGUIDE → búsqueda:
   https://www.getyourguide.com/s/?q={busqueda+ciudad}
   Ejemplo: https://www.getyourguide.com/s/?q=Torre+de+Belem+Lisboa
 
-Restaurantes → SIEMPRE Google Maps search:
+RESTAURANTES → SIEMPRE Google Maps search:
   https://www.google.com/maps/search/?api=1&query={nombre+ciudad}
-  Ejemplo: https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa
+  Ejemplo icónico: https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa
+  Ejemplo perfil: https://www.google.com/maps/search/?api=1&query=Tasca+tradicional+fado+Alfama+Lisboa
 
-Paseos libres / sin reserva → Google Maps del punto:
+PASEOS LIBRES / SIN RESERVA → Google Maps del punto:
   https://www.google.com/maps/search/?api=1&query={lugar+ciudad}
 
-Entradas oficiales → SOLO si conocés la URL exacta del sitio oficial (ej: https://castelodesaojorge.pt/). Si no, usá GetYourGuide como fallback.
+ENTRADAS OFICIALES → SOLO si conocés la URL exacta del sitio oficial (ej. https://castelodesaojorge.pt/). Si no, usá GetYourGuide como fallback.
 
-REGLA FINAL: jamás homepages sin parámetros. Siempre URL con fechas/huéspedes/búsqueda pre-rellenados. Para Skyscanner usá YYMMDD (6 dígitos), para las demás YYYY-MM-DD. Espacios se reemplazan con +.
+REGLA FINAL DE DEEPLINKS: jamás homepages sin parámetros. Para Skyscanner YYMMDD (6 dígitos). Para el resto YYYY-MM-DD. Espacios → +.
+
+═══════════════════════════════════════════════════════════
+FORMATO Y TONO
+═══════════════════════════════════════════════════════════
+
 - Devolvé SOLO el JSON. Sin "Aquí tienes:", sin markdown fences, sin texto antes o después. Empezá con { y terminá con }.
-- 3 transportes con distintas aerolíneas y rangos de precio. 1 con seleccionado=true (el mejor balance), otros false.
-- 3 alojamientos con precios/estilos/barrios variados. 1 seleccionado=true, otros false.
-- 6 actividades repartidas en los ${noches} días. 5 con seleccionado=true, 1 con false (alternativa).
-- 6 restaurantes mix €-€€€€. 5 seleccionado=true, 1 false.
+- 3 transportes con distintas aerolíneas y rangos de precio. 1 seleccionado=true (mejor balance), otros false.
+- 3 alojamientos con precios/estilos/barrios variados. 1 seleccionado=true, otros false. Recomendable: 1 icónico con rating real + 2 descriptivos con rating=null.
+- 6 actividades repartidas en los ${noches} días. 5 seleccionado=true, 1 false (alternativa).
+- 6 gastronomía mix €-€€€€. 5 seleccionado=true, 1 false. Recomendable: 1-2 icónicos con rating real + resto descriptivos con rating=null.
 - Voz: cálida, editorial, específica. Un plato icónico > "buena comida". Detalles únicos > genericidades.
-- Asumí origen Madrid (MAD) para vuelos salvo que el CONTEXTO ESPECÍFICO diga otra cosa.
-- Precios realistas en €. Rating Booking 8.5-9.8. Rating Airbnb 4.75-4.97. Rating Google 4.3-4.9.
-- Highlights: 3-4 beneficios concretos, no slogans.
+- Precios realistas en €.
 - Todo en castellano neutro.${viaje.intencion ? '\n- AJUSTÁ todas las recomendaciones al CONTEXTO ESPECÍFICO. Si mencionan teletrabajo, alojamiento con buen WiFi y espacio de trabajo. Si es luna de miel, rincones románticos. Si es mochileros, presupuesto bajo. Si hay niños, actividades familiares. Etc.' : ''}`
 }
 
