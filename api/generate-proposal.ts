@@ -1,5 +1,9 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import {
+  placesTextSearch,
+  fetchAndStorePhoto,
+} from './_lib/places'
 
 export const config = {
   runtime: 'nodejs',
@@ -84,168 +88,6 @@ function sanitize(item: any, schema: Record<string, FieldType>): any {
 function sanitizeArray(items: any, table: keyof typeof SCHEMAS): any[] {
   if (!Array.isArray(items)) return []
   return items.map((it) => sanitize(it, SCHEMAS[table]))
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Google Places (New) enrichment
-// ──────────────────────────────────────────────────────────────────────
-
-type PlaceMatch = {
-  name: string
-  rating: number | null
-  reviews: number | null
-  googleMapsUri: string | null
-  photoName: string | null
-  placeId: string
-  primaryType: string | null
-  types: string[]
-}
-
-const BAD_TYPES = new Set([
-  'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2',
-  'neighborhood', 'administrative_area_level_1', 'administrative_area_level_2',
-  'country', 'postal_code', 'political', 'route', 'street_address',
-])
-
-async function placesTextSearch(
-  query: string,
-  apiKey: string,
-  opts: { strict?: boolean } = {}
-): Promise<PlaceMatch | null> {
-  const { strict = true } = opts
-  try {
-    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask':
-          'places.id,places.displayName,places.rating,places.userRatingCount,places.googleMapsUri,places.photos,places.primaryType,places.types',
-      },
-      body: JSON.stringify({ textQuery: query, maxResultCount: 3, languageCode: 'es' }),
-    })
-    if (!res.ok) {
-      const errText = await res.text()
-      console.error(`[Places] ${res.status} for "${query}": ${errText.slice(0, 300)}`)
-      return null
-    }
-    const data = await res.json()
-    const places = (data.places || []) as any[]
-    if (!places.length) return null
-
-    // strict=true: filter out locality/neighborhood/country (for gastronomía/actividades)
-    // strict=false: accept anything (for destination hero — country/city photos are fine)
-    const good = strict
-      ? places.find((p) => {
-          const type = p.primaryType || ''
-          const types = p.types || []
-          if (BAD_TYPES.has(type)) return false
-          if (types.some((t: string) => BAD_TYPES.has(t))) return false
-          return true
-        })
-      : places[0]
-    if (!good) return null
-
-    return {
-      name: good.displayName?.text || '',
-      rating: typeof good.rating === 'number' ? good.rating : null,
-      reviews: typeof good.userRatingCount === 'number' ? good.userRatingCount : null,
-      googleMapsUri: good.googleMapsUri || null,
-      photoName: good.photos?.[0]?.name || null,
-      placeId: good.id || '',
-      primaryType: good.primaryType || null,
-      types: good.types || [],
-    }
-  } catch (e: any) {
-    console.error(`[Places] fetch threw for "${query}":`, e.message)
-    return null
-  }
-}
-
-// Hero image for the whole trip: search the destination on Places and download its top photo.
-// This fixes the problem of Claude inventing Unsplash photo IDs that return 404.
-async function fetchDestinationHero(
-  destino: string,
-  pais: string | null,
-  apiKey: string,
-  supaAdmin: SupabaseClient
-): Promise<string | null> {
-  const query = pais && !destino.toLowerCase().includes(pais.toLowerCase())
-    ? `${destino} ${pais}`
-    : destino
-
-  const match = await placesTextSearch(query, apiKey, { strict: false })
-  if (!match) {
-    console.warn(`[Hero] Places returned no match for destino "${query}"`)
-    return null
-  }
-  if (!match.photoName || !match.placeId) {
-    console.warn(`[Hero] Places match for "${query}" has no photo`)
-    return null
-  }
-
-  const url = await fetchAndStorePhoto(match.photoName, `hero-${match.placeId}`, apiKey, supaAdmin)
-  if (!url) {
-    console.warn(`[Hero] Photo download failed for "${query}"`)
-    return null
-  }
-  console.log(`[Hero] ${destino} → ${match.name} (${match.primaryType})`)
-  return url
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Photo download + upload to Supabase Storage
-// ──────────────────────────────────────────────────────────────────────
-
-async function fetchAndStorePhoto(
-  photoName: string,
-  placeId: string,
-  apiKey: string,
-  supaAdmin: SupabaseClient
-): Promise<string | null> {
-  try {
-    // Ask Places for the photo URI (skip HTTP redirect so we can fetch separately)
-    const photoApiUrl = `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=1600&skipHttpRedirect=true&key=${apiKey}`
-    const metaRes = await fetch(photoApiUrl)
-    if (!metaRes.ok) {
-      console.error(`[Photo] meta ${metaRes.status} for ${placeId}`)
-      return null
-    }
-    const meta = await metaRes.json()
-    const photoUri = meta.photoUri
-    if (!photoUri) {
-      console.error(`[Photo] no photoUri for ${placeId}`)
-      return null
-    }
-
-    // Download the actual image bytes
-    const imgRes = await fetch(photoUri)
-    if (!imgRes.ok) {
-      console.error(`[Photo] download ${imgRes.status} for ${placeId}`)
-      return null
-    }
-    const buf = new Uint8Array(await imgRes.arrayBuffer())
-    const contentType = imgRes.headers.get('content-type') || 'image/jpeg'
-    const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg'
-
-    // Upload to Supabase Storage (service_role bypasses RLS)
-    const filename = `${placeId}.${ext}`
-    const { error: upErr } = await supaAdmin.storage.from('place-photos').upload(filename, buf, {
-      contentType,
-      upsert: true,
-      cacheControl: '2592000', // 30 días
-    })
-    if (upErr) {
-      console.error(`[Photo] upload failed for ${placeId}: ${upErr.message}`)
-      return null
-    }
-
-    const { data: pub } = supaAdmin.storage.from('place-photos').getPublicUrl(filename)
-    return pub.publicUrl || null
-  } catch (e: any) {
-    console.error(`[Photo] threw for ${placeId}:`, e.message)
-    return null
-  }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -375,19 +217,19 @@ Alojamiento OPCIÓN B (descriptivo):
 
 Gastronomía (shape, el backend enriquece con Places):
 {
-  "nombre": "Cervejaria Ramiro",  // puede ser icónico o perfil descriptivo
+  "nombre": "Cervejaria Ramiro",
   "tipo_cocina": "Marisquería portuguesa",
   "barrio": "Anjos",
   "precio_rango": "€€€",
-  "rating": null,  // el backend lo llena desde Google
+  "rating": null,
   "dia_sugerido": 2,
   "descripcion": "Templo del marisco desde 1956. El camarón a la plancha y el sandwich prego son rito obligatorio.",
-  "img": "https://images.unsplash.com/photo-...",  // fallback si Places no tiene foto
-  "deeplink": "https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa",  // fallback si Places no matchea
+  "img": "https://images.unsplash.com/photo-...",
+  "deeplink": "https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa",
   "seleccionado": true
 }
 
-Actividad (shape, el backend enriquece con Places cuando es lugar físico):
+Actividad:
 {
   "nombre": "Castelo de São Jorge",
   "tipo": "Monumento",
@@ -408,7 +250,6 @@ ESTRUCTURA DE SALIDA (JSON completo)
 {
   "descripcion_corta": "Frase evocadora 40-80 chars",
   "descripcion_larga": "Párrafo editorial 200-350 chars",
-  "cover_img": "URL Unsplash del destino",
   "transporte": [ /* 3 items */ ],
   "alojamientos": [ /* 3 items */ ],
   "actividades": [ /* 6 items en ${noches} días */ ],
@@ -474,7 +315,7 @@ function extractJson(text: string): any {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Enrichment orchestration
+// Enrichment orchestration (gastronomía + actividades)
 // ──────────────────────────────────────────────────────────────────────
 
 type EnrichableItem = {
@@ -495,7 +336,6 @@ async function enrichItems(
   let enriched = 0
   let photoed = 0
 
-  // Step 1: Places text search in parallel
   const matches = await Promise.all(
     items.map(async (item) => {
       if (!item.nombre) return null
@@ -504,13 +344,11 @@ async function enrichItems(
     })
   )
 
-  // Step 2: For each match, apply enrichment + download photo in parallel
   await Promise.all(
     items.map(async (item, i) => {
       const match = matches[i]
       if (!match) return
 
-      // Update fields from Places
       item.nombre = match.name || item.nombre
       if (kind === 'gastronomia' && match.rating != null) {
         item.rating = match.rating
@@ -520,7 +358,6 @@ async function enrichItems(
       }
       enriched++
 
-      // Fetch + store photo
       if (match.photoName && match.placeId) {
         const photoUrl = await fetchAndStorePhoto(match.photoName, match.placeId, apiKey, supaAdmin)
         if (photoUrl) {
@@ -569,16 +406,13 @@ export default async function handler(req: any, res: any) {
       { global: { headers: { Authorization: `Bearer ${token}` } } }
     )
 
-    // Admin client only for Storage (bypasses RLS)
     const supaAdmin = SERVICE_KEY
       ? createClient(process.env.VITE_SUPABASE_URL, SERVICE_KEY, {
           auth: { autoRefreshToken: false, persistSession: false },
         })
       : null
 
-    const {
-      data: { user },
-    } = await supabase.auth.getUser(token)
+    const { data: { user } } = await supabase.auth.getUser(token)
     if (!user) return res.status(401).json({ error: 'Unauthorized (invalid token)' })
 
     const { data: allowed, error: allowErr } = await supabase.rpc('is_ksd_user')
@@ -640,13 +474,12 @@ export default async function handler(req: any, res: any) {
     )
 
     // ─── Enrich gastronomía + actividades with Google Places ────────
+    // (Hero image is handled by set-cover-image endpoint on viaje creation)
     let enrichmentSummary = ''
     if (placesEnabled && supaAdmin) {
       const city = viaje.destino
       try {
-        // Run hero lookup in parallel with gastro + actividades enrichment
-        const [heroUrl, gastroResult, actResult] = await Promise.all([
-          fetchDestinationHero(viaje.destino, viaje.pais, PLACES_KEY!, supaAdmin),
+        const [gastroResult, actResult] = await Promise.all([
           Array.isArray(json.gastronomia)
             ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
@@ -654,10 +487,7 @@ export default async function handler(req: any, res: any) {
             ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
         ])
-        if (heroUrl) {
-          json.cover_img = heroUrl
-        }
-        enrichmentSummary = `hero ${heroUrl ? '✓' : '✗'}; gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
+        enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
         console.log(`[Enrichment] ${enrichmentSummary}`)
       } catch (e: any) {
         console.error('[Enrichment] unexpected error (continuing without it):', e.message)
@@ -704,7 +534,6 @@ export default async function handler(req: any, res: any) {
 
     const failures = Object.entries(results).filter(([, r]) => !r.ok)
     if (failures.length) {
-      // Rollback
       await Promise.all([
         supabase.from('transporte').delete().eq('viaje_id', viaje_id),
         supabase.from('alojamientos').delete().eq('viaje_id', viaje_id),
@@ -717,13 +546,12 @@ export default async function handler(req: any, res: any) {
       })
     }
 
-    // ─── Update viaje (final step, so estado='propuesta' only if all ok) ─
+    // ─── Update viaje (NO tocamos cover_img — eso lo hace set-cover-image) ─
     const { error: upErr } = await supabase
       .from('viajes')
       .update({
         descripcion_corta: json.descripcion_corta,
         descripcion_larga: json.descripcion_larga,
-        cover_img: json.cover_img,
         estado: 'propuesta',
       })
       .eq('id', viaje_id)

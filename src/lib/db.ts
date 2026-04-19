@@ -57,7 +57,43 @@ export async function createViaje(v: Partial<Viaje>, viajerosIds: string[]) {
   if (viajerosIds.length) {
     await supabase.from('viajeros').insert(viajerosIds.map(pid => ({ viaje_id: newId, persona_id: pid })))
   }
+
+  // Fetch hero image from Google Places. Best-effort: if it fails or times out,
+  // we still return the newId so the trip creation succeeds. Frontend falls
+  // back to gradient in that case.
+  try {
+    await setCoverImage(newId, 12000)
+  } catch (e) {
+    console.warn('[createViaje] set-cover-image failed (non-blocking):', e)
+  }
+
   return newId as string
+}
+
+// Call the /api/set-cover-image endpoint with a timeout.
+async function setCoverImage(viajeId: string, timeoutMs = 12000): Promise<void> {
+  const { data: { session } } = await supabase.auth.getSession()
+  if (!session) return
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  try {
+    const res = await fetch('/api/set-cover-image', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.access_token}`,
+      },
+      body: JSON.stringify({ viaje_id: viajeId }),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      console.warn(`[set-cover-image] HTTP ${res.status}`)
+    }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 export async function deleteViaje(id: string) {
