@@ -103,6 +103,7 @@ export type Viaje = {
   cover_img: string | null
   descripcion_corta: string | null
   descripcion_larga: string | null
+  intencion: string
   viajeros: string[]
   transporte: Transporte[]
   alojamientos: Alojamiento[]

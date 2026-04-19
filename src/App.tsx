@@ -766,6 +766,7 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }:
   const [showGenModal, setShowGenModal] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [genError, setGenError] = useState<string | null>(null)
+  const [pendingIntencion, setPendingIntencion] = useState<string>('')
 
   if (!viaje) return <div className="max-w-3xl mx-auto px-6 py-20 text-center" style={{ color: C.muted }}>Viaje no encontrado.</div>
 
@@ -786,12 +787,12 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }:
     await db.toggleItem(category, optionId, next)
   }
 
-  const handleGenerate = async () => {
+  const handleGenerate = async (intencion?: string) => {
     setShowGenModal(false)
     setGenerating(true)
     setGenError(null)
     try {
-      await db.generateProposal(viaje.id)
+      await db.generateProposal(viaje.id, intencion)
       await onReload()
     } catch (e: any) {
       setGenError(e.message || 'Error generando propuesta')
@@ -850,7 +851,12 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }:
 
       <div className="max-w-6xl mx-auto px-6 py-16">
         {isEmpty ? (
-          <EmptyProposal viaje={viaje} travelers={travelers} onGenerate={() => setShowGenModal(true)} error={genError} />
+          <EmptyProposal viaje={viaje} travelers={travelers}
+            onGenerate={(intencion: string) => {
+              setPendingIntencion(intencion)
+              setShowGenModal(true)
+            }}
+            error={genError} />
         ) : (
           <>
             {viaje.descripcion_larga && (
@@ -932,7 +938,7 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }:
 
       {showGenModal && (
         <GenerateModal viaje={viaje} travelers={travelers}
-          onCancel={() => setShowGenModal(false)} onConfirm={handleGenerate} />
+          onCancel={() => setShowGenModal(false)} onConfirm={() => handleGenerate(pendingIntencion)} />
       )}
       {generating && <GeneratingOverlay destino={viaje.destino} />}
     </div>
@@ -1176,6 +1182,8 @@ function GastronomiaCard({ option, onSelect }: any) {
 }
 
 function EmptyProposal({ viaje, travelers, onGenerate, error }: any) {
+  const [intencion, setIntencion] = useState(viaje.intencion || '')
+
   return (
     <div className="max-w-2xl mx-auto px-6 py-16 text-center">
       <div className="tracking-caps mb-6" style={{ color: C.aegean }}>La propuesta aún no existe</div>
@@ -1188,13 +1196,32 @@ function EmptyProposal({ viaje, travelers, onGenerate, error }: any) {
         diseñe una propuesta completa — vuelos, alojamientos, actividades y restaurantes —
         pensada específicamente para ustedes.
       </p>
+
+      <div className="mb-8 text-left">
+        <label className="tracking-caps-sm mb-3 block" style={{ color: C.muted }}>
+          ¿Algo más que deba saber la IA? <span className="normal-case tracking-normal" style={{ fontWeight: 400 }}>(opcional)</span>
+        </label>
+        <textarea
+          value={intencion}
+          onChange={e => setIntencion(e.target.value)}
+          rows={4}
+          placeholder="Ej: voy un mes pero quiero una semana de vacaciones reales y el resto teletrabajar desde allá. Prefiero alojamiento con buen WiFi y espacio para trabajar…"
+          className="w-full bg-white border rounded-2xl p-4 text-base leading-relaxed"
+          style={{ borderColor: C.line, color: C.inkSoft }}
+        />
+        <p className="text-xs mt-2" style={{ color: C.muted }}>
+          Tipo de viaje, ritmo, prioridades, restricciones. Cualquier cosa que ayude a la IA a personalizar.
+        </p>
+      </div>
+
       {error && (
-        <div className="mb-6 p-4 rounded-xl text-sm text-left mx-auto max-w-md"
+        <div className="mb-6 p-4 rounded-xl text-sm text-left"
              style={{ background: '#F5DDD4', color: '#7A2E1E' }}>
           <strong>Algo falló:</strong> {error}
         </div>
       )}
-      <button onClick={onGenerate}
+
+      <button onClick={() => onGenerate(intencion)}
         className="px-8 h-14 rounded-full inline-flex items-center gap-2 text-base btn-primary">
         <Sparkles size={18} /> Soñar este viaje
       </button>

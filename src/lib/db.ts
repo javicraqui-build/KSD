@@ -75,7 +75,20 @@ export async function toggleItem(table: 'actividades' | 'gastronomia', id: strin
   if (error) throw error
 }
 
-export async function generateProposal(viajeId: string): Promise<void> {
+export async function updateIntencion(viajeId: string, intencion: string) {
+  const { error } = await supabase
+    .from('viajes')
+    .update({ intencion })
+    .eq('id', viajeId)
+  if (error) throw error
+}
+
+export async function generateProposal(viajeId: string, intencion?: string): Promise<void> {
+  // Si el usuario escribió una intención, la guardamos antes de llamar al endpoint
+  if (typeof intencion === 'string') {
+    await updateIntencion(viajeId, intencion)
+  }
+
   const {
     data: { session },
   } = await supabase.auth.getSession()
@@ -92,6 +105,7 @@ export async function generateProposal(viajeId: string): Promise<void> {
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
-    throw new Error(err.error || `Error generando propuesta`)
+    const detail = err.detail ? ` (${err.detail})` : ''
+    throw new Error(`${err.error || `Error ${res.status}`}${detail}`)
   }
 }

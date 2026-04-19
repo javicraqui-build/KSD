@@ -6,7 +6,9 @@ export const config = {
   maxDuration: 60,
 }
 
-const SYSTEM = `Sos un concierge de viajes con sensibilidad editorial — voz cálida, específica, evocadora. Tu output es SIEMPRE un JSON válido sin texto adicional, sin markdown fences.`
+const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5'
+
+const SYSTEM = `Sos un concierge de viajes con sensibilidad editorial — voz cálida, específica, evocadora. Tu output es SIEMPRE un JSON válido sin texto adicional, sin markdown fences, sin explicaciones.`
 
 function buildPrompt(viaje: any, personas: any[]): string {
   const noches = Math.max(
@@ -25,9 +27,13 @@ function buildPrompt(viaje: any, personas: any[]): string {
         : ''
       return `- ${p.nombre}: intereses (${intereses}); estilo (${estilo}); ritmo ${p.ritmo}${
         dietas ? `; dietas: ${dietas}` : ''
-      }${p.notas ? `; notas: ${p.notas}` : ''}`
+      }${p.notas ? `; notas personales: ${p.notas}` : ''}`
     })
     .join('\n')
+
+  const intencionBlock = viaje.intencion
+    ? `\n\nCONTEXTO ESPECÍFICO DE ESTE VIAJE (importantísimo, tomalo muy en cuenta al diseñar la propuesta):\n"${viaje.intencion}"\n`
+    : ''
 
   return `Armá una propuesta de viaje completa para:
 
@@ -35,8 +41,7 @@ DESTINO: ${viaje.destino}${viaje.pais ? `, ${viaje.pais}` : ''}
 FECHAS: ${viaje.fecha_inicio} al ${viaje.fecha_fin} (${noches} noches)
 PRESUPUESTO TOTAL ORIENTATIVO: ${viaje.presupuesto_total}€
 VIAJEROS (${personas.length} personas):
-${personasDesc}
-
+${personasDesc}${intencionBlock}
 Devolvé un JSON con ESTA estructura exacta:
 
 {
@@ -73,8 +78,8 @@ Devolvé un JSON con ESTA estructura exacta:
       "rating": 9.2,
       "reviews": 1247,
       "highlights": ["4 highlights"],
-      "img": "URL Unsplash interior hotel/apartamento",
-      "deeplink": "https://www.booking.com/searchresults.html?ss=...&checkin=${viaje.fecha_inicio}&checkout=${viaje.fecha_fin}&group_adults=${personas.length}",
+      "img": "URL Unsplash",
+      "deeplink": "https://www.booking.com/searchresults.html?ss=...",
       "seleccionado": true
     }
   ],
@@ -101,7 +106,7 @@ Devolvé un JSON con ESTA estructura exacta:
       "rating": 4.6,
       "dia_sugerido": 1,
       "descripcion": "Mencioná el plato icónico o la vibra — no genericidades",
-      "img": "URL Unsplash de comida o interior",
+      "img": "URL Unsplash",
       "deeplink": "https://www.google.com/maps/search/?api=1&query=Nombre+Restaurante+${viaje.destino}",
       "seleccionado": true
     }
@@ -109,16 +114,43 @@ Devolvé un JSON con ESTA estructura exacta:
 }
 
 REGLAS ESTRICTAS:
-- Devolvé SOLO el JSON, sin markdown fences ni texto antes/después.
+- Devolvé SOLO el JSON. Sin "Aquí tienes:", sin markdown fences, sin texto antes o después. Empezá con { y terminá con }.
 - 3 transportes con distintas aerolíneas y rangos de precio. 1 con seleccionado=true (el mejor balance), otros false.
 - 3 alojamientos con precios/estilos/barrios variados. 1 seleccionado=true, otros false.
 - 6 actividades repartidas en los ${noches} días. 5 con seleccionado=true, 1 con false (alternativa).
 - 6 restaurantes mix €-€€€€. 5 seleccionado=true, 1 false.
 - Voz: cálida, editorial, específica. Un plato icónico > "buena comida". Detalles únicos > genericidades.
-- Asumí origen Madrid (MAD) para vuelos. Usá IATA reales del destino.
+- Asumí origen Madrid (MAD) para vuelos salvo que el CONTEXTO ESPECÍFICO diga otra cosa.
 - Precios realistas en €. Rating Booking 8.5-9.8. Rating Airbnb 4.75-4.97. Rating Google 4.3-4.9.
 - Highlights: 3-4 beneficios concretos, no slogans.
-- Todo en castellano neutro.`
+- Todo en castellano neutro.${viaje.intencion ? '\n- AJUSTÁ todas las recomendaciones al CONTEXTO ESPECÍFICO. Si mencionan teletrabajo, alojamiento con buen WiFi y espacio de trabajo. Si es luna de miel, rincones románticos. Si es mochileros, presupuesto bajo. Si hay niños, actividades familiares. Etc.' : ''}`
+}
+
+// Parser robusto: aguanta preámbulos, markdown fences, etc.
+function extractJson(text: string): any {
+  const attempts: Array<() => any> = [
+    // 1 · Parse directo (Claude obedeció las reglas)
+    () => JSON.parse(text.trim()),
+    // 2 · Strippeá markdown fences
+    () => JSON.parse(text.replace(/```json\s*|```\s*/g, '').trim()),
+    // 3 · Extraé desde el primer { hasta el último }
+    () => {
+      const first = text.indexOf('{')
+      const last = text.lastIndexOf('}')
+      if (first < 0 || last <= first) throw new Error('no braces found')
+      return JSON.parse(text.slice(first, last + 1))
+    },
+  ]
+
+  let lastErr: Error | null = null
+  for (const attempt of attempts) {
+    try {
+      return attempt()
+    } catch (e: any) {
+      lastErr = e
+    }
+  }
+  throw lastErr || new Error('Unknown parse error')
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -126,67 +158,116 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response('Method not allowed', { status: 405 })
   }
 
+  // Chequeos de env al inicio (errores claros si falta algo)
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return Response.json(
+      { error: 'ANTHROPIC_API_KEY no configurada en Vercel' },
+      { status: 500 }
+    )
+  }
+  if (!process.env.VITE_SUPABASE_URL || !process.env.VITE_SUPABASE_ANON_KEY) {
+    return Response.json(
+      { error: 'VITE_SUPABASE_URL o VITE_SUPABASE_ANON_KEY no configuradas en Vercel' },
+      { status: 500 }
+    )
+  }
+
   try {
-    // Auth: Bearer token desde el frontend
+    // Auth
     const authHeader = req.headers.get('authorization')
     if (!authHeader?.startsWith('Bearer ')) {
       return Response.json({ error: 'Unauthorized' }, { status: 401 })
     }
     const token = authHeader.slice(7)
 
-    const supabaseUrl = process.env.VITE_SUPABASE_URL!
-    const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY!
+    const supabase = createClient(
+      process.env.VITE_SUPABASE_URL,
+      process.env.VITE_SUPABASE_ANON_KEY,
+      { global: { headers: { Authorization: `Bearer ${token}` } } }
+    )
 
-    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-      global: { headers: { Authorization: `Bearer ${token}` } },
-    })
-
-    // Verify session
     const {
       data: { user },
     } = await supabase.auth.getUser(token)
-    if (!user) return Response.json({ error: 'Unauthorized' }, { status: 401 })
+    if (!user) return Response.json({ error: 'Unauthorized (invalid token)' }, { status: 401 })
 
-    // Verify allowlist (doble defensa)
     const { data: allowed, error: allowErr } = await supabase.rpc('is_ksd_user')
-    if (allowErr || !allowed) return Response.json({ error: 'Forbidden' }, { status: 403 })
+    if (allowErr) {
+      return Response.json(
+        { error: 'Error checking allowlist', detail: allowErr.message },
+        { status: 500 }
+      )
+    }
+    if (!allowed) return Response.json({ error: 'Forbidden (not in allowlist)' }, { status: 403 })
 
-    // Parse body
-    const { viaje_id } = await req.json()
+    // Body
+    const body = await req.json().catch(() => null)
+    const viaje_id = body?.viaje_id
     if (!viaje_id) return Response.json({ error: 'viaje_id required' }, { status: 400 })
 
-    // Fetch viaje + personas
+    // Fetch viaje
     const { data: viaje, error: vErr } = await supabase
       .from('viajes')
       .select('*, viajeros(personas(*))')
       .eq('id', viaje_id)
       .single()
 
-    if (vErr || !viaje) return Response.json({ error: 'Viaje not found' }, { status: 404 })
+    if (vErr || !viaje) {
+      return Response.json(
+        { error: 'Viaje not found', detail: vErr?.message },
+        { status: 404 }
+      )
+    }
 
     const personas = (viaje.viajeros as any[]).map((v: any) => v.personas).filter(Boolean)
     if (personas.length === 0)
-      return Response.json({ error: 'No viajeros' }, { status: 400 })
+      return Response.json({ error: 'El viaje no tiene viajeros asignados' }, { status: 400 })
 
     // Call Claude
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
-    const msg = await anthropic.messages.create({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 8000,
-      system: SYSTEM,
-      messages: [{ role: 'user', content: buildPrompt(viaje, personas) }],
-    })
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-    const content = msg.content.find((c: any) => c.type === 'text')
-    if (!content || content.type !== 'text') throw new Error('No text response from Claude')
+    let msg
+    try {
+      msg = await anthropic.messages.create({
+        model: MODEL,
+        max_tokens: 8000,
+        system: SYSTEM,
+        messages: [{ role: 'user', content: buildPrompt(viaje, personas) }],
+      })
+    } catch (apiErr: any) {
+      console.error('Anthropic API error:', apiErr)
+      return Response.json(
+        {
+          error: 'Anthropic API error',
+          detail: apiErr.message || String(apiErr),
+          status: apiErr.status,
+          model_used: MODEL,
+        },
+        { status: 502 }
+      )
+    }
+
+    const textBlock = msg.content.find((c: any) => c.type === 'text') as any
+    if (!textBlock?.text) {
+      return Response.json(
+        { error: 'Claude returned no text', raw: JSON.stringify(msg).slice(0, 500) },
+        { status: 500 }
+      )
+    }
 
     let json: any
     try {
-      const jsonText = (content as any).text.trim().replace(/^```json\n?|\n?```$/g, '')
-      json = JSON.parse(jsonText)
-    } catch (e) {
-      console.error('JSON parse failed. Raw response:', (content as any).text)
-      return Response.json({ error: 'AI response malformed' }, { status: 500 })
+      json = extractJson(textBlock.text)
+    } catch (e: any) {
+      console.error('JSON parse failed. Raw:', textBlock.text.slice(0, 2000))
+      return Response.json(
+        {
+          error: 'AI response malformed',
+          detail: e.message,
+          raw: textBlock.text.slice(0, 800),
+        },
+        { status: 500 }
+      )
     }
 
     const noches = Math.max(
@@ -196,8 +277,8 @@ export default async function handler(req: Request): Promise<Response> {
       )
     )
 
-    // Update viaje (descripciones + cover)
-    await supabase
+    // Update viaje
+    const { error: upErr } = await supabase
       .from('viajes')
       .update({
         descripcion_corta: json.descripcion_corta,
@@ -206,8 +287,14 @@ export default async function handler(req: Request): Promise<Response> {
         estado: 'propuesta',
       })
       .eq('id', viaje_id)
+    if (upErr) {
+      return Response.json(
+        { error: 'Error actualizando viaje', detail: upErr.message },
+        { status: 500 }
+      )
+    }
 
-    // Clear existing children (para regeneraciones)
+    // Clear existing children
     await Promise.all([
       supabase.from('transporte').delete().eq('viaje_id', viaje_id),
       supabase.from('alojamientos').delete().eq('viaje_id', viaje_id),
@@ -217,7 +304,6 @@ export default async function handler(req: Request): Promise<Response> {
 
     // Insert new children
     const errors: string[] = []
-
     if (Array.isArray(json.transporte) && json.transporte.length) {
       const { error } = await supabase
         .from('transporte')
@@ -244,7 +330,22 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (errors.length) {
-      return Response.json({ error: 'Partial failure', details: errors }, { status: 500 })
+      return Response.json(
+        { error: 'Errores insertando en DB', details: errors },
+        { status: 500 }
+      )
     }
 
-    return Response.json({ succ
+    return Response.json({ success: true, viaje_id })
+  } catch (err: any) {
+    console.error('Generate proposal error:', err)
+    return Response.json(
+      {
+        error: 'Error inesperado',
+        detail: err.message || String(err),
+        stack: err.stack?.split('\n').slice(0, 5).join('\n'),
+      },
+      { status: 500 }
+    )
+  }
+}
