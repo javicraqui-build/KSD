@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
-import { createClient } from '@supabase/supabase-js'
+import { createClient, SupabaseClient } from '@supabase/supabase-js'
 
 export const config = {
   runtime: 'nodejs',
@@ -10,12 +10,12 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-5'
 
 const SYSTEM = `Sos un concierge de viajes con sensibilidad editorial — voz cálida, específica, evocadora. Tu output es SIEMPRE un JSON válido sin texto adicional, sin markdown fences, sin explicaciones.
 
-Sos un modelo de lenguaje, NO una base de datos en tiempo real de vuelos, hoteles o restaurantes. Tu trabajo es CURAR EL ESTILO del viaje y guiar al usuario a búsquedas reales via deeplinks. NUNCA inventes nombres específicos que suenan plausibles pero no existen. Si no tenés 100% de certeza de que algo existe con un nombre exacto, usá un nombre DESCRIPTIVO del perfil y dejá campos factuales (rating, número de vuelo) en null. El deeplink lleva al usuario a una búsqueda real — ahí ve opciones concretas.
+Sos un modelo de lenguaje, NO una base de datos en tiempo real de vuelos, hoteles o restaurantes. Tu trabajo es CURAR EL ESTILO del viaje y guiar al usuario a búsquedas reales via deeplinks. NUNCA inventes nombres específicos que suenan plausibles pero no existen. Si no tenés 100% de certeza de que algo existe con un nombre exacto, usá un nombre DESCRIPTIVO del perfil y dejá campos factuales (rating, número de vuelo) en null.
 
 RESPETÁ LOS TIPOS DE DATO EXACTAMENTE como indica el schema. Si un campo es número, devolvé número o null — NUNCA texto. Si un campo es array de strings, devolvé array — NUNCA string concatenado. Confundir tipos rompe la inserción en DB.`
 
 // ──────────────────────────────────────────────────────────────────────
-// Sanitización de tipos (defensiva contra que el LLM confunda tipos)
+// Sanitización de tipos
 // ──────────────────────────────────────────────────────────────────────
 
 type FieldType = 'string' | 'integer' | 'number' | 'boolean' | 'date' | 'array'
@@ -51,60 +51,25 @@ function coerce(value: any, type: FieldType): any {
 
 const SCHEMAS: Record<string, Record<string, FieldType>> = {
   transporte: {
-    tipo: 'string',
-    compania: 'string',
-    numero_ida: 'string',
-    numero_vuelta: 'string',
-    origen: 'string',
-    destino: 'string',
-    fecha_ida: 'date',
-    hora_ida_salida: 'string',
-    hora_ida_llegada: 'string',
-    fecha_vuelta: 'date',
-    hora_vuelta_salida: 'string',
-    hora_vuelta_llegada: 'string',
-    precio: 'number',
-    duracion: 'string',
-    highlights: 'array',
-    deeplink: 'string',
-    seleccionado: 'boolean',
+    tipo: 'string', compania: 'string', numero_ida: 'string', numero_vuelta: 'string',
+    origen: 'string', destino: 'string', fecha_ida: 'date', hora_ida_salida: 'string',
+    hora_ida_llegada: 'string', fecha_vuelta: 'date', hora_vuelta_salida: 'string',
+    hora_vuelta_llegada: 'string', precio: 'number', duracion: 'string',
+    highlights: 'array', deeplink: 'string', seleccionado: 'boolean',
   },
   alojamientos: {
-    plataforma: 'string',
-    nombre: 'string',
-    barrio: 'string',
-    tipo: 'string',
-    precio_noche: 'number',
-    rating: 'number',
-    reviews: 'integer',
-    highlights: 'array',
-    img: 'string',
-    deeplink: 'string',
-    seleccionado: 'boolean',
+    plataforma: 'string', nombre: 'string', barrio: 'string', tipo: 'string',
+    precio_noche: 'number', rating: 'number', reviews: 'integer',
+    highlights: 'array', img: 'string', deeplink: 'string', seleccionado: 'boolean',
   },
   actividades: {
-    nombre: 'string',
-    tipo: 'string',
-    dia: 'integer',
-    duracion: 'string',
-    precio: 'number',
-    descripcion: 'string',
-    plataforma: 'string',
-    img: 'string',
-    deeplink: 'string',
-    seleccionado: 'boolean',
+    nombre: 'string', tipo: 'string', dia: 'integer', duracion: 'string', precio: 'number',
+    descripcion: 'string', plataforma: 'string', img: 'string', deeplink: 'string', seleccionado: 'boolean',
   },
   gastronomia: {
-    nombre: 'string',
-    tipo_cocina: 'string',
-    barrio: 'string',
-    precio_rango: 'string',
-    rating: 'number',
-    dia_sugerido: 'integer',
-    descripcion: 'string',
-    img: 'string',
-    deeplink: 'string',
-    seleccionado: 'boolean',
+    nombre: 'string', tipo_cocina: 'string', barrio: 'string', precio_rango: 'string',
+    rating: 'number', dia_sugerido: 'integer', descripcion: 'string', img: 'string',
+    deeplink: 'string', seleccionado: 'boolean',
   },
 }
 
@@ -119,6 +84,129 @@ function sanitize(item: any, schema: Record<string, FieldType>): any {
 function sanitizeArray(items: any, table: keyof typeof SCHEMAS): any[] {
   if (!Array.isArray(items)) return []
   return items.map((it) => sanitize(it, SCHEMAS[table]))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Google Places (New) enrichment
+// ──────────────────────────────────────────────────────────────────────
+
+type PlaceMatch = {
+  name: string
+  rating: number | null
+  reviews: number | null
+  googleMapsUri: string | null
+  photoName: string | null
+  placeId: string
+  primaryType: string | null
+  types: string[]
+}
+
+const BAD_TYPES = new Set([
+  'locality', 'sublocality', 'sublocality_level_1', 'sublocality_level_2',
+  'neighborhood', 'administrative_area_level_1', 'administrative_area_level_2',
+  'country', 'postal_code', 'political', 'route', 'street_address',
+])
+
+async function placesTextSearch(query: string, apiKey: string): Promise<PlaceMatch | null> {
+  try {
+    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask':
+          'places.id,places.displayName,places.rating,places.userRatingCount,places.googleMapsUri,places.photos,places.primaryType,places.types',
+      },
+      body: JSON.stringify({ textQuery: query, maxResultCount: 3, languageCode: 'es' }),
+    })
+    if (!res.ok) {
+      const errText = await res.text()
+      console.error(`[Places] ${res.status} for "${query}": ${errText.slice(0, 300)}`)
+      return null
+    }
+    const data = await res.json()
+    const places = (data.places || []) as any[]
+    if (!places.length) return null
+
+    // Pick the first place that is not a neighborhood/locality
+    const good = places.find((p) => {
+      const type = p.primaryType || ''
+      const types = p.types || []
+      if (BAD_TYPES.has(type)) return false
+      if (types.some((t: string) => BAD_TYPES.has(t))) return false
+      return true
+    })
+    if (!good) return null
+
+    return {
+      name: good.displayName?.text || '',
+      rating: typeof good.rating === 'number' ? good.rating : null,
+      reviews: typeof good.userRatingCount === 'number' ? good.userRatingCount : null,
+      googleMapsUri: good.googleMapsUri || null,
+      photoName: good.photos?.[0]?.name || null,
+      placeId: good.id || '',
+      primaryType: good.primaryType || null,
+      types: good.types || [],
+    }
+  } catch (e: any) {
+    console.error(`[Places] fetch threw for "${query}":`, e.message)
+    return null
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Photo download + upload to Supabase Storage
+// ──────────────────────────────────────────────────────────────────────
+
+async function fetchAndStorePhoto(
+  photoName: string,
+  placeId: string,
+  apiKey: string,
+  supaAdmin: SupabaseClient
+): Promise<string | null> {
+  try {
+    // Ask Places for the photo URI (skip HTTP redirect so we can fetch separately)
+    const photoApiUrl = `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=1600&skipHttpRedirect=true&key=${apiKey}`
+    const metaRes = await fetch(photoApiUrl)
+    if (!metaRes.ok) {
+      console.error(`[Photo] meta ${metaRes.status} for ${placeId}`)
+      return null
+    }
+    const meta = await metaRes.json()
+    const photoUri = meta.photoUri
+    if (!photoUri) {
+      console.error(`[Photo] no photoUri for ${placeId}`)
+      return null
+    }
+
+    // Download the actual image bytes
+    const imgRes = await fetch(photoUri)
+    if (!imgRes.ok) {
+      console.error(`[Photo] download ${imgRes.status} for ${placeId}`)
+      return null
+    }
+    const buf = new Uint8Array(await imgRes.arrayBuffer())
+    const contentType = imgRes.headers.get('content-type') || 'image/jpeg'
+    const ext = contentType.includes('png') ? 'png' : contentType.includes('webp') ? 'webp' : 'jpg'
+
+    // Upload to Supabase Storage (service_role bypasses RLS)
+    const filename = `${placeId}.${ext}`
+    const { error: upErr } = await supaAdmin.storage.from('place-photos').upload(filename, buf, {
+      contentType,
+      upsert: true,
+      cacheControl: '2592000', // 30 días
+    })
+    if (upErr) {
+      console.error(`[Photo] upload failed for ${placeId}: ${upErr.message}`)
+      return null
+    }
+
+    const { data: pub } = supaAdmin.storage.from('place-photos').getPublicUrl(filename)
+    return pub.publicUrl || null
+  } catch (e: any) {
+    console.error(`[Photo] threw for ${placeId}:`, e.message)
+    return null
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -162,62 +250,61 @@ VIAJEROS (${personas.length} personas):
 ${personasDesc}${intencionBlock}
 
 ═══════════════════════════════════════════════════════════
-REGLAS DE HONESTIDAD (CRÍTICAS — NUNCA VIOLES ESTO)
+REGLAS DE HONESTIDAD (CRÍTICAS)
 ═══════════════════════════════════════════════════════════
 
-No sabés horarios reales del día de hoy, ni números de vuelo actuales, ni inventarios específicos de hoteles/restaurantes. Seguí estas reglas al pie de la letra:
+No sabés horarios reales del día de hoy, ni números de vuelo actuales, ni inventarios específicos de hoteles/restaurantes. Importante: los nombres de restaurantes y actividades que devuelvas van a ser ENRIQUECIDOS DESPUÉS con Google Places — o sea, tu trabajo es darme el MEJOR QUERY DE BÚSQUEDA posible. Un query preciso y descriptivo te devuelve un lugar real que matchea el perfil. Un nombre inventado específico no matchea con nada.
 
 1) TRANSPORTE (vuelos):
-   • numero_ida y numero_vuelta: SIEMPRE null. No inventes números de vuelo.
-   • compania: poné aerolíneas TÍPICAS DE LA RUTA (ej. ${origen}→${viaje.destino}).
-   • hora_ida_salida / hora_ida_llegada / hora_vuelta_*: horarios ESTIMATIVOS realistas.
+   • numero_ida y numero_vuelta: SIEMPRE null.
+   • compania: aerolíneas TÍPICAS DE LA RUTA (${origen}→${viaje.destino}).
+   • horarios: estimativos realistas.
    • precio: promedio razonable para esa ruta y temporada.
-   • duracion: la duración real típica del vuelo directo.
-   • El deeplink de Skyscanner es el HÉROE — ahí el usuario verá vuelos reales.
+   • duracion: duración real del vuelo directo.
 
-2) ALOJAMIENTO — dos opciones:
-   OPCIÓN A (icónico): si conocés un alojamiento específico y verificable del destino (ej. Memmo Alfama en Lisboa, Belmond Reid's Palace en Madeira): nombre real + rating/reviews coherentes (números reales).
-   OPCIÓN B (descriptivo): si NO tenés 100% certeza: usá nombre DESCRIPTIVO del perfil, con rating=null y reviews=null.
-      Ejemplos válidos para opción B:
-       - "Apartamento boutique en Alfama con vista al Tajo"
-       - "Casa tradicional con patio en Graça"
-       - "Hotel de diseño en Príncipe Real"
-   NUNCA inventes nombres específicos plausibles que no existen (ej. "Hotel Belvedere Lisboa"). Si dudás, usá opción B.
+2) ALOJAMIENTO:
+   OPCIÓN A (icónico): hoteles específicos y verificables (Memmo Alfama, Belmond Reid's Palace): nombre real + rating/reviews reales.
+   OPCIÓN B (descriptivo): nombre perfil ("Apartamento boutique en Alfama con vista al Tajo"), rating=null, reviews=null.
+   Si dudás → opción B.
 
-3) GASTRONOMÍA — mismas dos opciones:
-   OPCIÓN A (icónico): restaurantes famosos verificables (ej. Cervejaria Ramiro en Lisboa, Casa Lucio en Madrid): nombre real + rating numérico realista.
-   OPCIÓN B (descriptivo): nombre DESCRIPTIVO del perfil, rating=null.
-      Ejemplos válidos para opción B:
+3) GASTRONOMÍA (ESTOS SE ENRIQUECEN CON GOOGLE PLACES):
+   OPCIÓN A (icónico verificable): nombre real del lugar famoso (Cervejaria Ramiro, Casa Lucio). Google lo va a encontrar y te va a dar datos reales.
+   OPCIÓN B (perfil descriptivo): query de búsqueda que describa un tipo de lugar real. Claves:
+      - Combiná TIPO + BARRIO/CIUDAD
+      - Sé específico, no genérico
+      - Usá vocabulario que use Google Maps ("tasca", "marisquería", "pastelería")
+      Ejemplos que funcionan bien como search:
        - "Tasca tradicional con fado en Alfama"
-       - "Marisquería de barrio en Cascais"
-       - "Pastelería histórica en Belém"
-   NUNCA inventes restaurantes concretos con nombre propio si no estás seguro.
+       - "Marisquería Cascais"
+       - "Pastelería histórica Belém"
+       - "Rooftop bar con vista al Tajo"
+       - "Ginjinha tradicional Rossio"
+   NUNCA inventes un nombre propio que no existe (ej. "Restaurante Azul del Tajo").
 
-4) ACTIVIDADES:
-   • Museos, monumentos, miradores, barrios, atracciones fijas: SÍ podés nombrar (Castelo de São Jorge, Torre de Belém, Museu Nacional do Azulejo).
-   • Tours y experiencias guiadas: describí el TIPO sin nombrar empresas comerciales (ej. "Free walking tour por Alfama al atardecer", "Tour de fado por tascas tradicionales").
+4) ACTIVIDADES (ESTAS TAMBIÉN SE ENRIQUECEN CON GOOGLE PLACES cuando sea un LUGAR FÍSICO):
+   OPCIÓN A (lugar físico concreto): museos, monumentos, miradores, parques, barrios. Google los encuentra.
+      Ejemplos: "Castelo de São Jorge", "Torre de Belém", "Museu Nacional do Azulejo", "Mirador de Santa Catarina", "Oceanário de Lisboa"
+   OPCIÓN B (tour/experiencia guiada/paseo): describí el tipo, NO se enriquece con Places.
+      Ejemplos: "Free walking tour por Alfama al atardecer", "Tour de fado por tascas", "Clase de pastéis de nata"
 
 ═══════════════════════════════════════════════════════════
 TIPOS DE DATO — RESPETAR EXACTAMENTE
 ═══════════════════════════════════════════════════════════
 
-Cada campo tiene UN tipo. Devolverlo con otro tipo rompe la inserción en la DB:
+- Campos de TEXTO: string o null.
+- Campos NUMÉRICOS con decimales (rating, precio, precio_noche): number o null. NUNCA texto.
+- Campos NUMÉRICOS enteros (reviews, dia, dia_sugerido): integer o null. NUNCA texto descriptivo.
+- Campos ARRAY (highlights): array de strings. NUNCA string concatenado.
+- Campos DATE (fecha_ida, fecha_vuelta): string "YYYY-MM-DD".
+- Campos BOOLEAN (seleccionado): true o false.
 
-- Campos de TEXTO (nombre, barrio, tipo, compania, descripcion, etc.): string o null.
-- Campos NUMÉRICOS con decimales (rating, precio, precio_noche): number o null. Ejemplo válido: 8.7. NUNCA string ("8.7") ni texto.
-- Campos NUMÉRICOS enteros (reviews, dia, dia_sugerido): integer o null. Ejemplo válido: 1247. NUNCA string ni texto descriptivo.
-- Campos ARRAY (highlights): array de strings. Ejemplo válido: ["Rooftop con vistas", "Desayuno incluido"]. NUNCA un string concatenado como "Rooftop, desayuno".
-- Campos DATE (fecha_ida, fecha_vuelta): string en formato "YYYY-MM-DD".
-- Campos BOOLEAN (seleccionado): true o false. NUNCA string.
-
-⚠️ ERROR COMÚN A EVITAR: confundir "reviews" (CANTIDAD de reseñas, un integer) con una descripción textual.
-  reviews=1247 ✅    reviews="muy bueno" ❌    reviews=null ✅
+⚠️ ERROR A EVITAR: reviews=1247 ✅    reviews="muy bueno" ❌    reviews=null ✅
 
 ═══════════════════════════════════════════════════════════
-EJEMPLOS DE ITEMS (respetá este shape exacto)
+EJEMPLOS DE ITEMS
 ═══════════════════════════════════════════════════════════
 
-Alojamiento OPCIÓN A (icónico, con datos reales):
+Alojamiento OPCIÓN A (icónico):
 {
   "plataforma": "Booking",
   "nombre": "Memmo Alfama",
@@ -226,13 +313,13 @@ Alojamiento OPCIÓN A (icónico, con datos reales):
   "precio_noche": 215,
   "rating": 8.8,
   "reviews": 1247,
-  "highlights": ["Rooftop con vistas al Tajo", "Piscina infinita", "Desayuno portugués incluido", "Edificio del siglo XVIII"],
+  "highlights": ["Rooftop con vistas al Tajo", "Piscina infinita", "Desayuno portugués incluido"],
   "img": "https://images.unsplash.com/photo-...",
   "deeplink": "https://www.booking.com/searchresults.html?ss=Memmo+Alfama+Lisboa&checkin=${viaje.fecha_inicio}&checkout=${viaje.fecha_fin}&group_adults=${personas.length}",
   "seleccionado": true
 }
 
-Alojamiento OPCIÓN B (perfil descriptivo, sin nombre real):
+Alojamiento OPCIÓN B (descriptivo):
 {
   "plataforma": "Airbnb",
   "nombre": "Apartamento boutique en Alfama con vista al Tajo",
@@ -241,37 +328,37 @@ Alojamiento OPCIÓN B (perfil descriptivo, sin nombre real):
   "precio_noche": 140,
   "rating": null,
   "reviews": null,
-  "highlights": ["Azulejos originales del siglo XIX", "Terraza privada", "5 min a pie del Castelo", "Cocina equipada"],
+  "highlights": ["Azulejos originales", "Terraza privada", "5 min a pie del Castelo"],
   "img": "https://images.unsplash.com/photo-...",
   "deeplink": "https://www.airbnb.com/s/Lisboa--Alfama/homes?checkin=${viaje.fecha_inicio}&checkout=${viaje.fecha_fin}&adults=${personas.length}",
   "seleccionado": false
 }
 
-Gastronomía OPCIÓN A (icónico):
+Gastronomía (shape, el backend enriquece con Places):
 {
-  "nombre": "Cervejaria Ramiro",
+  "nombre": "Cervejaria Ramiro",  // puede ser icónico o perfil descriptivo
   "tipo_cocina": "Marisquería portuguesa",
   "barrio": "Anjos",
   "precio_rango": "€€€",
-  "rating": 4.6,
+  "rating": null,  // el backend lo llena desde Google
   "dia_sugerido": 2,
-  "descripcion": "Templo del marisco desde 1956. El camarón a la plancha y el sandwich prego al final son rito obligatorio.",
-  "img": "https://images.unsplash.com/photo-...",
-  "deeplink": "https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa",
+  "descripcion": "Templo del marisco desde 1956. El camarón a la plancha y el sandwich prego son rito obligatorio.",
+  "img": "https://images.unsplash.com/photo-...",  // fallback si Places no tiene foto
+  "deeplink": "https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa",  // fallback si Places no matchea
   "seleccionado": true
 }
 
-Gastronomía OPCIÓN B (perfil):
+Actividad (shape, el backend enriquece con Places cuando es lugar físico):
 {
-  "nombre": "Tasca tradicional con fado en Alfama",
-  "tipo_cocina": "Portuguesa tradicional",
-  "barrio": "Alfama",
-  "precio_rango": "€€",
-  "rating": null,
-  "dia_sugerido": 3,
-  "descripcion": "Una tasca íntima donde el fado se canta a la hora de la cena, entre bacalhau à brás y vinho verde.",
+  "nombre": "Castelo de São Jorge",
+  "tipo": "Monumento",
+  "dia": 1,
+  "duracion": "2-3h",
+  "precio": 15,
+  "descripcion": "Fortaleza moura del siglo XI con vistas panorámicas de Lisboa desde sus murallas.",
+  "plataforma": "Entrada oficial",
   "img": "https://images.unsplash.com/photo-...",
-  "deeplink": "https://www.google.com/maps/search/?api=1&query=Tasca+fado+Alfama+Lisboa",
+  "deeplink": "https://www.google.com/maps/search/?api=1&query=Castelo+Sao+Jorge+Lisboa",
   "seleccionado": true
 }
 
@@ -281,77 +368,52 @@ ESTRUCTURA DE SALIDA (JSON completo)
 
 {
   "descripcion_corta": "Frase evocadora 40-80 chars",
-  "descripcion_larga": "Párrafo editorial 200-350 chars que pinte el viaje",
-  "cover_img": "URL de Unsplash del destino (photo-XXXX con ?w=2000&q=85&auto=format&fit=crop)",
+  "descripcion_larga": "Párrafo editorial 200-350 chars",
+  "cover_img": "URL Unsplash del destino",
   "transporte": [ /* 3 items */ ],
-  "alojamientos": [ /* 3 items — ver ejemplos arriba */ ],
-  "actividades": [ /* 6 items repartidas en ${noches} días */ ],
-  "gastronomia": [ /* 6 items — ver ejemplos arriba */ ]
+  "alojamientos": [ /* 3 items */ ],
+  "actividades": [ /* 6 items en ${noches} días */ ],
+  "gastronomia": [ /* 6 items */ ]
 }
 
-Schema de transporte:
+Schema transporte:
 {
   "tipo": "vuelo",
   "compania": "TAP Air Portugal",
-  "numero_ida": null,
-  "numero_vuelta": null,
-  "origen": "código IATA 3 letras del aeropuerto principal de ${origen}",
-  "destino": "código IATA 3 letras del destino",
-  "fecha_ida": "${viaje.fecha_inicio}",
-  "hora_ida_salida": "10:15",
-  "hora_ida_llegada": "10:45",
-  "fecha_vuelta": "${viaje.fecha_fin}",
-  "hora_vuelta_salida": "18:30",
-  "hora_vuelta_llegada": "21:00",
-  "precio": 284,
-  "duracion": "2h 30m",
-  "highlights": ["Vuelo directo", "Equipaje de mano incluido", "Horarios orientativos"],
-  "deeplink": "URL de Skyscanner con parámetros",
-  "seleccionado": true
-}
-
-Schema de actividad:
-{
-  "nombre": "Nombre del lugar fijo o tipo de experiencia",
-  "tipo": "Monumento / Experiencia / Patrimonio / Excursión / Paseo libre / Museo",
-  "dia": 1,
-  "duracion": "2-3h",
-  "precio": 15,
-  "descripcion": "1-2 oraciones evocadoras con detalles específicos",
-  "plataforma": "Civitatis / GetYourGuide / Entrada oficial / Sin reserva",
-  "img": "URL Unsplash",
-  "deeplink": "URL real con búsqueda",
+  "numero_ida": null, "numero_vuelta": null,
+  "origen": "IATA 3 letras de ${origen}", "destino": "IATA 3 letras",
+  "fecha_ida": "${viaje.fecha_inicio}", "hora_ida_salida": "10:15", "hora_ida_llegada": "10:45",
+  "fecha_vuelta": "${viaje.fecha_fin}", "hora_vuelta_salida": "18:30", "hora_vuelta_llegada": "21:00",
+  "precio": 284, "duracion": "2h 30m",
+  "highlights": ["Vuelo directo", "Equipaje de mano", "Horarios orientativos"],
+  "deeplink": "URL Skyscanner con params",
   "seleccionado": true
 }
 
 ═══════════════════════════════════════════════════════════
-REGLAS DE DEEPLINKS (CRÍTICO — NUNCA uses URLs genéricas sin parámetros)
+DEEPLINKS (fallback si Places no enriquece)
 ═══════════════════════════════════════════════════════════
 
-VUELOS → SIEMPRE Skyscanner:
-  https://www.skyscanner.net/transport/flights/{iata_origen_lower}/{iata_destino_lower}/{YYMMDD_ida}/{YYMMDD_vuelta}/?adults={n}
-  Ejemplo: https://www.skyscanner.net/transport/flights/mad/lis/260715/260815/?adults=2
-
+VUELOS → https://www.skyscanner.net/transport/flights/{iata_o}/{iata_d}/{YYMMDD_i}/{YYMMDD_v}/?adults={n}
 BOOKING → https://www.booking.com/searchresults.html?ss={query}&checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&group_adults={n}
 AIRBNB → https://www.airbnb.com/s/{ciudad--barrio}/homes?checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&adults={n}
-CIVITATIS → https://www.civitatis.com/es/{ciudad-slug}/?q={busqueda}
+CIVITATIS → https://www.civitatis.com/es/{ciudad}/?q={busqueda}
 GETYOURGUIDE → https://www.getyourguide.com/s/?q={busqueda+ciudad}
 RESTAURANTES → https://www.google.com/maps/search/?api=1&query={nombre+ciudad}
+LUGARES FÍSICOS → https://www.google.com/maps/search/?api=1&query={nombre+ciudad}
 
-REGLA FINAL: jamás homepages sin parámetros. Skyscanner usa YYMMDD (6 dígitos), resto YYYY-MM-DD. Espacios → +.
+Skyscanner YYMMDD (6 dígitos), resto YYYY-MM-DD. Espacios → +.
 
 ═══════════════════════════════════════════════════════════
 FORMATO Y TONO
 ═══════════════════════════════════════════════════════════
 
-- Devolvé SOLO el JSON. Sin "Aquí tienes:", sin markdown fences. Empezá con { y terminá con }.
-- 3 transportes con distintas aerolíneas. 1 seleccionado=true (mejor balance), otros false.
-- 3 alojamientos con precios/estilos/barrios variados. 1 seleccionado=true. Mix recomendado: 0-1 icónico + 2-3 descriptivos.
-- 6 actividades repartidas en los ${noches} días. 5 seleccionado=true, 1 false.
-- 6 gastronomía mix €-€€€€. 5 seleccionado=true, 1 false. Mix recomendado: 1-2 icónicos + 4-5 descriptivos.
-- Voz: cálida, editorial, específica. Un plato icónico > "buena comida". Detalles únicos > genericidades.
+- SOLO el JSON. Sin "Aquí tienes:", sin markdown fences. Empezá con { y terminá con }.
+- 3 transportes · 3 alojamientos · 6 actividades · 6 gastronomía.
+- 1 seleccionado=true por sección (alojamiento/transporte), 5 de 6 en actividades/gastronomía.
+- Voz cálida, editorial, específica. Un plato icónico > "buena comida".
 - Precios realistas en €.
-- Todo en castellano neutro.${viaje.intencion ? '\n- AJUSTÁ todas las recomendaciones al CONTEXTO ESPECÍFICO del viaje.' : ''}`
+- Castellano neutro.${viaje.intencion ? '\n- AJUSTÁ todas las recomendaciones al CONTEXTO ESPECÍFICO del viaje.' : ''}`
 }
 
 function extractJson(text: string): any {
@@ -365,16 +427,72 @@ function extractJson(text: string): any {
       return JSON.parse(text.slice(first, last + 1))
     },
   ]
-
   let lastErr: Error | null = null
   for (const attempt of attempts) {
-    try {
-      return attempt()
-    } catch (e: any) {
-      lastErr = e
-    }
+    try { return attempt() } catch (e: any) { lastErr = e }
   }
   throw lastErr || new Error('Unknown parse error')
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Enrichment orchestration
+// ──────────────────────────────────────────────────────────────────────
+
+type EnrichableItem = {
+  nombre: string | null
+  rating?: number | null
+  img: string | null
+  deeplink: string | null
+  [k: string]: any
+}
+
+async function enrichItems(
+  items: EnrichableItem[],
+  city: string,
+  kind: 'gastronomia' | 'actividad',
+  apiKey: string,
+  supaAdmin: SupabaseClient
+): Promise<{ enriched: number; photoed: number }> {
+  let enriched = 0
+  let photoed = 0
+
+  // Step 1: Places text search in parallel
+  const matches = await Promise.all(
+    items.map(async (item) => {
+      if (!item.nombre) return null
+      const query = `${item.nombre} ${city}`
+      return await placesTextSearch(query, apiKey)
+    })
+  )
+
+  // Step 2: For each match, apply enrichment + download photo in parallel
+  await Promise.all(
+    items.map(async (item, i) => {
+      const match = matches[i]
+      if (!match) return
+
+      // Update fields from Places
+      item.nombre = match.name || item.nombre
+      if (kind === 'gastronomia' && match.rating != null) {
+        item.rating = match.rating
+      }
+      if (match.googleMapsUri) {
+        item.deeplink = match.googleMapsUri
+      }
+      enriched++
+
+      // Fetch + store photo
+      if (match.photoName && match.placeId) {
+        const photoUrl = await fetchAndStorePhoto(match.photoName, match.placeId, apiKey, supaAdmin)
+        if (photoUrl) {
+          item.img = photoUrl
+          photoed++
+        }
+      }
+    })
+  )
+
+  return { enriched, photoed }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -382,15 +500,21 @@ function extractJson(text: string): any {
 // ──────────────────────────────────────────────────────────────────────
 
 export default async function handler(req: any, res: any) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada en Vercel' })
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY no configurada' })
   }
   if (!process.env.VITE_SUPABASE_URL || !process.env.VITE_SUPABASE_ANON_KEY) {
-    return res.status(500).json({ error: 'VITE_SUPABASE_URL o VITE_SUPABASE_ANON_KEY no configuradas en Vercel' })
+    return res.status(500).json({ error: 'Supabase env vars no configuradas' })
+  }
+
+  const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY
+  const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const placesEnabled = !!PLACES_KEY && !!SERVICE_KEY
+
+  if (!placesEnabled) {
+    console.warn('[Places] GOOGLE_PLACES_API_KEY o SUPABASE_SERVICE_ROLE_KEY faltantes — enrichment deshabilitado')
   }
 
   try {
@@ -406,15 +530,20 @@ export default async function handler(req: any, res: any) {
       { global: { headers: { Authorization: `Bearer ${token}` } } }
     )
 
+    // Admin client only for Storage (bypasses RLS)
+    const supaAdmin = SERVICE_KEY
+      ? createClient(process.env.VITE_SUPABASE_URL, SERVICE_KEY, {
+          auth: { autoRefreshToken: false, persistSession: false },
+        })
+      : null
+
     const {
       data: { user },
     } = await supabase.auth.getUser(token)
     if (!user) return res.status(401).json({ error: 'Unauthorized (invalid token)' })
 
     const { data: allowed, error: allowErr } = await supabase.rpc('is_ksd_user')
-    if (allowErr) {
-      return res.status(500).json({ error: 'Error checking allowlist', detail: allowErr.message })
-    }
+    if (allowErr) return res.status(500).json({ error: 'Error checking allowlist', detail: allowErr.message })
     if (!allowed) return res.status(403).json({ error: 'Forbidden (not in allowlist)' })
 
     const body = req.body
@@ -426,19 +555,13 @@ export default async function handler(req: any, res: any) {
       .select('*, viajeros(personas(*))')
       .eq('id', viaje_id)
       .single()
-
-    if (vErr || !viaje) {
-      return res.status(404).json({ error: 'Viaje not found', detail: vErr?.message })
-    }
+    if (vErr || !viaje) return res.status(404).json({ error: 'Viaje not found', detail: vErr?.message })
 
     const personas = (viaje.viajeros as any[]).map((v: any) => v.personas).filter(Boolean)
-    if (personas.length === 0) {
-      return res.status(400).json({ error: 'El viaje no tiene viajeros asignados' })
-    }
+    if (personas.length === 0) return res.status(400).json({ error: 'El viaje no tiene viajeros asignados' })
 
     // ─── Call Claude ────────────────────────────────────────────────
     const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
     let msg
     try {
       msg = await anthropic.messages.create({
@@ -467,11 +590,7 @@ export default async function handler(req: any, res: any) {
       json = extractJson(textBlock.text)
     } catch (e: any) {
       console.error('JSON parse failed. Raw:', textBlock.text.slice(0, 2000))
-      return res.status(500).json({
-        error: 'AI response malformed',
-        detail: e.message,
-        raw: textBlock.text.slice(0, 800),
-      })
+      return res.status(500).json({ error: 'AI response malformed', detail: e.message, raw: textBlock.text.slice(0, 800) })
     }
 
     const noches = Math.max(
@@ -481,13 +600,33 @@ export default async function handler(req: any, res: any) {
       )
     )
 
-    // ─── Sanitize all sections BEFORE any DB write ─────────────────
+    // ─── Enrich gastronomía + actividades with Google Places ────────
+    let enrichmentSummary = ''
+    if (placesEnabled && supaAdmin) {
+      const city = viaje.destino
+      try {
+        const [gastroResult, actResult] = await Promise.all([
+          Array.isArray(json.gastronomia)
+            ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin)
+            : { enriched: 0, photoed: 0 },
+          Array.isArray(json.actividades)
+            ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin)
+            : { enriched: 0, photoed: 0 },
+        ])
+        enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
+        console.log(`[Enrichment] ${enrichmentSummary}`)
+      } catch (e: any) {
+        console.error('[Enrichment] unexpected error (continuing without it):', e.message)
+      }
+    }
+
+    // ─── Sanitize ───────────────────────────────────────────────────
     const transporteRows = sanitizeArray(json.transporte, 'transporte').map((t) => ({ ...t, viaje_id }))
     const alojamientosRows = sanitizeArray(json.alojamientos, 'alojamientos').map((a) => ({ ...a, viaje_id, noches }))
     const actividadesRows = sanitizeArray(json.actividades, 'actividades').map((a) => ({ ...a, viaje_id }))
     const gastronomiaRows = sanitizeArray(json.gastronomia, 'gastronomia').map((g) => ({ ...g, viaje_id }))
 
-    // ─── Clear existing children (para regeneraciones) ─────────────
+    // ─── Clear existing children ────────────────────────────────────
     await Promise.all([
       supabase.from('transporte').delete().eq('viaje_id', viaje_id),
       supabase.from('alojamientos').delete().eq('viaje_id', viaje_id),
@@ -495,17 +634,13 @@ export default async function handler(req: any, res: any) {
       supabase.from('gastronomia').delete().eq('viaje_id', viaje_id),
     ])
 
-    // ─── Insert all children, track per-table result ───────────────
+    // ─── Insert ─────────────────────────────────────────────────────
     const results: Record<string, { ok: boolean; error?: string; sample?: string }> = {}
-
     const doInsert = async (
       table: 'transporte' | 'alojamientos' | 'actividades' | 'gastronomia',
       rows: any[]
     ) => {
-      if (!rows.length) {
-        results[table] = { ok: true }
-        return
-      }
+      if (!rows.length) { results[table] = { ok: true }; return }
       const { error } = await supabase.from(table).insert(rows)
       if (error) {
         const sample = JSON.stringify(rows[0]).slice(0, 600)
@@ -524,9 +659,8 @@ export default async function handler(req: any, res: any) {
     ])
 
     const failures = Object.entries(results).filter(([, r]) => !r.ok)
-
     if (failures.length) {
-      // ROLLBACK: borrar todo lo que sí entró, dejar viaje en 'idea'
+      // Rollback
       await Promise.all([
         supabase.from('transporte').delete().eq('viaje_id', viaje_id),
         supabase.from('alojamientos').delete().eq('viaje_id', viaje_id),
@@ -539,7 +673,7 @@ export default async function handler(req: any, res: any) {
       })
     }
 
-    // ─── All inserts ok → now update the viaje (estado='propuesta') ─
+    // ─── Update viaje (final step, so estado='propuesta' only if all ok) ─
     const { error: upErr } = await supabase
       .from('viajes')
       .update({
@@ -556,7 +690,7 @@ export default async function handler(req: any, res: any) {
       })
     }
 
-    return res.status(200).json({ success: true, viaje_id })
+    return res.status(200).json({ success: true, viaje_id, enrichment: enrichmentSummary })
   } catch (err: any) {
     console.error('Generate proposal error:', err)
     return res.status(500).json({
