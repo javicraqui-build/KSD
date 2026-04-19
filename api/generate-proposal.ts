@@ -114,6 +114,40 @@ Devolvé un JSON con ESTA estructura exacta:
 }
 
 REGLAS ESTRICTAS:
+REGLAS DE DEEPLINKS (CRÍTICO — NUNCA uses URLs genéricas sin parámetros):
+
+Vuelos → SIEMPRE Skyscanner con todos los parámetros, sin importar la aerolínea:
+  https://www.skyscanner.net/transport/flights/{iata_origen_lower}/{iata_destino_lower}/{YYMMDD_ida}/{YYMMDD_vuelta}/?adults={n}
+  Ejemplo: https://www.skyscanner.net/transport/flights/mad/lis/260715/260815/?adults=2
+  NO uses URLs tipo flytap.com o ryanair.com sin parámetros.
+
+Alojamiento Booking → búsqueda con fechas y huéspedes:
+  https://www.booking.com/searchresults.html?ss={hotel+ciudad}&checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&group_adults={n}
+  Ejemplo: https://www.booking.com/searchresults.html?ss=Memmo+Alfama+Lisboa&checkin=2026-05-15&checkout=2026-05-20&group_adults=2
+
+Alojamiento Airbnb → búsqueda pre-rellenada:
+  https://www.airbnb.com/s/{ciudad--barrio}/homes?checkin={YYYY-MM-DD}&checkout={YYYY-MM-DD}&adults={n}
+  Ejemplo: https://www.airbnb.com/s/Lisboa--Principe-Real/homes?checkin=2026-05-15&checkout=2026-05-20&adults=2
+
+Actividades Civitatis → búsqueda específica de esa actividad en la ciudad:
+  https://www.civitatis.com/es/{ciudad-slug}/?q={busqueda}
+  Ejemplo: https://www.civitatis.com/es/lisboa/?q=fado+alfama
+  NO uses URL genérica tipo https://www.civitatis.com/es/lisboa/
+
+Actividades GetYourGuide → búsqueda:
+  https://www.getyourguide.com/s/?q={busqueda+ciudad}
+  Ejemplo: https://www.getyourguide.com/s/?q=Torre+de+Belem+Lisboa
+
+Restaurantes → SIEMPRE Google Maps search:
+  https://www.google.com/maps/search/?api=1&query={nombre+ciudad}
+  Ejemplo: https://www.google.com/maps/search/?api=1&query=Cervejaria+Ramiro+Lisboa
+
+Paseos libres / sin reserva → Google Maps del punto:
+  https://www.google.com/maps/search/?api=1&query={lugar+ciudad}
+
+Entradas oficiales → SOLO si conocés la URL exacta del sitio oficial (ej: https://castelodesaojorge.pt/). Si no, usá GetYourGuide como fallback.
+
+REGLA FINAL: jamás homepages sin parámetros. Siempre URL con fechas/huéspedes/búsqueda pre-rellenados. Para Skyscanner usá YYMMDD (6 dígitos), para las demás YYYY-MM-DD. Espacios se reemplazan con +.
 - Devolvé SOLO el JSON. Sin "Aquí tienes:", sin markdown fences, sin texto antes o después. Empezá con { y terminá con }.
 - 3 transportes con distintas aerolíneas y rangos de precio. 1 con seleccionado=true (el mejor balance), otros false.
 - 3 alojamientos con precios/estilos/barrios variados. 1 seleccionado=true, otros false.

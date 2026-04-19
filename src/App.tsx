@@ -90,8 +90,10 @@ const nightsBetween = (a: string | null, b: string | null) => {
 const tripTotal = (v: Viaje) => {
   const t = v.transporte.filter(x => x.seleccionado).reduce((s, x) => s + (x.precio || 0), 0)
   const a = v.alojamientos.filter(x => x.seleccionado).reduce((s, x) => s + ((x.precio_noche || 0) * (x.noches || 0)), 0)
-  const ac = v.actividades.filter(x => x.seleccionado).reduce((s, x) => s + (x.precio || 0), 0) * Math.max(1, v.viajeros.length)
-  return { transporte: t, alojamiento: a, actividades: ac, gastronomia: 0, total: t + a + ac }
+  const acPorPersona = v.actividades.filter(x => x.seleccionado).reduce((s, x) => s + (x.precio || 0), 0)
+  const numViajeros = Math.max(1, v.viajeros.length)
+  const ac = acPorPersona * numViajeros
+  return { transporte: t, alojamiento: a, actividades: ac, actividadesPorPersona: acPorPersona, numViajeros, gastronomia: 0, total: t + a + ac }
 }
 
 type View =
@@ -907,7 +909,7 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }:
               <div className="grid md:grid-cols-4 gap-4 mb-10">
                 <TotalCell label="Transporte" value={total.transporte} />
                 <TotalCell label="Alojamiento" value={total.alojamiento} />
-                <TotalCell label="Actividades" value={total.actividades} sub={`×${travelers.length || 1}`} />
+                <TotalCell label="Actividades" value={total.actividades} sub={total.numViajeros > 1 ? `${total.actividadesPorPersona.toLocaleString('es-ES')}€ × ${total.numViajeros} pax` : undefined} />
                 <TotalCell label="Total estimado" value={total.total} highlight />
               </div>
               <div className="space-y-2 mb-10">
@@ -969,8 +971,8 @@ function TotalCell({ label, value, sub, highlight }: any) {
       <div className="tracking-caps-sm mb-2" style={{ color: highlight ? C.muted : C.sand, opacity: highlight ? 1 : 0.8 }}>{label}</div>
       <div className="font-display text-3xl">
         {value.toLocaleString('es-ES')}<span className="text-lg opacity-60">€</span>
-        {sub && <span className="text-sm opacity-60 ml-1">{sub}</span>}
       </div>
+      {sub && <div className="text-xs opacity-60 mt-1">{sub}</div>}
     </div>
   )
 }
