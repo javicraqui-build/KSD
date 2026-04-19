@@ -24,6 +24,15 @@ const BAD_TYPES = new Set([
   'country', 'postal_code', 'political', 'route', 'street_address',
 ])
 
+// Types válidos para alojamientos (Places API New, Table A)
+const LODGING_TYPES = new Set([
+  'lodging', 'hotel', 'motel', 'inn', 'hostel',
+  'bed_and_breakfast', 'guest_house', 'private_guest_room',
+  'resort_hotel', 'extended_stay_hotel',
+  'japanese_inn', 'budget_japanese_inn',
+  'cottage', 'farmstay', 'campground', 'camping_cabin',
+])
+
 type PlaceMatch = {
   name: string
   rating: number | null
@@ -38,9 +47,9 @@ type PlaceMatch = {
 async function placesTextSearch(
   query: string,
   apiKey: string,
-  opts: { strict?: boolean } = {}
+  opts: { strict?: boolean; requireTypes?: Set<string> } = {}
 ): Promise<PlaceMatch | null> {
-  const { strict = true } = opts
+  const { strict = true, requireTypes } = opts
   try {
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
@@ -61,7 +70,15 @@ async function placesTextSearch(
     const places = (data.places || []) as any[]
     if (!places.length) return null
 
-    const good = strict
+    const good = requireTypes
+      ? places.find((p) => {
+          const type = p.primaryType || ''
+          const types = p.types || []
+          if (requireTypes.has(type)) return true
+          if (types.some((t: string) => requireTypes.has(t))) return true
+          return false
+        })
+      : strict
       ? places.find((p) => {
           const type = p.primaryType || ''
           const types = p.types || []
@@ -261,10 +278,15 @@ No sabés horarios reales del día de hoy, ni números de vuelo actuales, ni inv
    • precio: promedio razonable para esa ruta y temporada.
    • duracion: duración real del vuelo directo.
 
-2) ALOJAMIENTO:
-   OPCIÓN A (icónico): hoteles específicos y verificables (Memmo Alfama, Belmond Reid's Palace): nombre real + rating/reviews reales.
-   OPCIÓN B (descriptivo): nombre perfil ("Apartamento boutique en Alfama con vista al Tajo"), rating=null, reviews=null.
-   Si dudás → opción B.
+2) ALOJAMIENTO (ESTOS SE ENRIQUECEN CON GOOGLE PLACES):
+   Los nombres los valida y reemplaza Google Places con hoteles/apartments reales. Tu trabajo es darme el MEJOR QUERY DE BÚSQUEDA posible.
+   OPCIÓN A (icónico verificable): nombre real del hotel específico (Memmo Alfama, Belmond Reid's Palace, Hotel Santa Justa). Google lo encuentra exacto.
+   OPCIÓN B (perfil descriptivo): query que describa un TIPO de lugar real y matcheable. Claves:
+      - Incluí siempre la palabra "Hotel" / "Apartment" / "Boutique" / "Hostel" / "Guesthouse" — Places necesita entender que es alojamiento.
+      - Combiná TIPO + BARRIO/CIUDAD (ej. "Boutique hotel Alfama Lisboa", "Apartment Chiado Lisboa", "Design hotel Príncipe Real").
+      - Evitá nombres "poéticos" que no matchean ("Casa del Viento en el Tajo") — usá descriptores directos ("Riverside boutique hotel Lisboa").
+   Si dudás → opción B (siempre con "hotel"/"apartment"/etc explícito).
+   Para rating/reviews: si tenés certeza 100%, ponelos; si no, null (Google los va a completar).
 
 3) GASTRONOMÍA (ESTOS SE ENRIQUECEN CON GOOGLE PLACES):
    OPCIÓN A (icónico verificable): nombre real del lugar famoso (Cervejaria Ramiro, Casa Lucio). Google lo va a encontrar y te va a dar datos reales.
@@ -318,18 +340,18 @@ Alojamiento OPCIÓN A (icónico):
   "seleccionado": true
 }
 
-Alojamiento OPCIÓN B (descriptivo):
+Alojamiento OPCIÓN B (descriptivo, matcheable en Places):
 {
-  "plataforma": "Airbnb",
-  "nombre": "Apartamento boutique en Alfama con vista al Tajo",
+  "plataforma": "Booking",
+  "nombre": "Boutique hotel Alfama Lisboa",
   "barrio": "Alfama",
-  "tipo": "Apartamento entero",
+  "tipo": "Hotel boutique",
   "precio_noche": 140,
   "rating": null,
   "reviews": null,
-  "highlights": ["Azulejos originales", "Terraza privada", "5 min a pie del Castelo"],
+  "highlights": ["Azulejos originales", "Terraza con vista al Tajo", "5 min a pie del Castelo"],
   "img": "https://images.unsplash.com/photo-...",
-  "deeplink": "https://www.airbnb.com/s/Lisboa--Alfama/homes?checkin=${viaje.fecha_inicio}&checkout=${viaje.fecha_fin}&adults=${personas.length}",
+  "deeplink": "https://www.booking.com/searchresults.html?ss=Boutique+hotel+Alfama+Lisboa&checkin=${viaje.fecha_inicio}&checkout=${viaje.fecha_fin}&group_adults=${personas.length}",
   "seleccionado": false
 }
 
@@ -444,12 +466,25 @@ type EnrichableItem = {
   [k: string]: any
 }
 
+// Build a Booking deeplink pointing to the real hotel name (post-enrichment)
+function buildBookingDeeplink(
+  name: string,
+  city: string,
+  checkin: string,
+  checkout: string,
+  adults: number
+): string {
+  const q = encodeURIComponent(`${name} ${city}`)
+  return `https://www.booking.com/searchresults.html?ss=${q}&checkin=${checkin}&checkout=${checkout}&group_adults=${adults}`
+}
+
 async function enrichItems(
   items: EnrichableItem[],
   city: string,
-  kind: 'gastronomia' | 'actividad',
+  kind: 'gastronomia' | 'actividad' | 'alojamiento',
   apiKey: string,
-  supaAdmin: SupabaseClient
+  supaAdmin: SupabaseClient,
+  lodgingCtx?: { checkin: string; checkout: string; adults: number }
 ): Promise<{ enriched: number; photoed: number }> {
   let enriched = 0
   let photoed = 0
@@ -458,6 +493,9 @@ async function enrichItems(
     items.map(async (item) => {
       if (!item.nombre) return null
       const query = `${item.nombre} ${city}`
+      if (kind === 'alojamiento') {
+        return await placesTextSearch(query, apiKey, { requireTypes: LODGING_TYPES })
+      }
       return await placesTextSearch(query, apiKey)
     })
   )
@@ -468,12 +506,32 @@ async function enrichItems(
       if (!match) return
 
       item.nombre = match.name || item.nombre
+
       if (kind === 'gastronomia' && match.rating != null) {
         item.rating = match.rating
       }
-      if (match.googleMapsUri) {
+
+      if (kind === 'alojamiento') {
+        // Update rating & reviews with real Google data (scale 1–5)
+        if (match.rating != null) item.rating = match.rating
+        if (match.reviews != null) item.reviews = match.reviews
+
+        // Regenerate Booking deeplink with real hotel name, keep plataforma=Booking
+        if (lodgingCtx) {
+          item.plataforma = 'Booking'
+          item.deeplink = buildBookingDeeplink(
+            match.name,
+            city,
+            lodgingCtx.checkin,
+            lodgingCtx.checkout,
+            lodgingCtx.adults
+          )
+        }
+      } else if (match.googleMapsUri) {
+        // Gastronomía/actividades: deeplink va al pin de Google Maps
         item.deeplink = match.googleMapsUri
       }
+
       enriched++
 
       if (match.photoName && match.placeId) {
@@ -591,21 +649,29 @@ export default async function handler(req: any, res: any) {
       )
     )
 
-    // ─── Enrich gastronomía + actividades with Google Places ────────
+    // ─── Enrich gastronomía + actividades + alojamientos con Google Places ──
     // (Hero image is handled by set-cover-image endpoint on viaje creation)
     let enrichmentSummary = ''
     if (placesEnabled && supaAdmin) {
       const city = viaje.destino
+      const lodgingCtx = {
+        checkin: viaje.fecha_inicio,
+        checkout: viaje.fecha_fin,
+        adults: personas.length,
+      }
       try {
-        const [gastroResult, actResult] = await Promise.all([
+        const [gastroResult, actResult, lodgResult] = await Promise.all([
           Array.isArray(json.gastronomia)
             ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
           Array.isArray(json.actividades)
             ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin)
             : { enriched: 0, photoed: 0 },
+          Array.isArray(json.alojamientos)
+            ? enrichItems(json.alojamientos, city, 'alojamiento', PLACES_KEY!, supaAdmin, lodgingCtx)
+            : { enriched: 0, photoed: 0 },
         ])
-        enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched, ${gastroResult.photoed} photos; actividades ${actResult.enriched}/6 matched, ${actResult.photoed} photos`
+        enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched (${gastroResult.photoed} photos); actividades ${actResult.enriched}/6 matched (${actResult.photoed} photos); alojamientos ${lodgResult.enriched}/3 matched (${lodgResult.photoed} photos)`
         console.log(`[Enrichment] ${enrichmentSummary}`)
       } catch (e: any) {
         console.error('[Enrichment] unexpected error (continuing without it):', e.message)
