@@ -42,24 +42,38 @@ type PlaceMatch = {
   placeId: string
   primaryType: string | null
   types: string[]
+  location: { lat: number; lng: number } | null
 }
 
 async function placesTextSearch(
   query: string,
   apiKey: string,
-  opts: { strict?: boolean; requireTypes?: Set<string> } = {}
+  opts: {
+    strict?: boolean
+    requireTypes?: Set<string>
+    locationBias?: { lat: number; lng: number; radius: number }
+  } = {}
 ): Promise<PlaceMatch | null> {
-  const { strict = true, requireTypes } = opts
+  const { strict = true, requireTypes, locationBias } = opts
   try {
+    const body: any = { textQuery: query, maxResultCount: 3, languageCode: 'es' }
+    if (locationBias) {
+      body.locationBias = {
+        circle: {
+          center: { latitude: locationBias.lat, longitude: locationBias.lng },
+          radius: locationBias.radius,
+        },
+      }
+    }
     const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': apiKey,
         'X-Goog-FieldMask':
-          'places.id,places.displayName,places.rating,places.userRatingCount,places.googleMapsUri,places.photos,places.primaryType,places.types',
+          'places.id,places.displayName,places.rating,places.userRatingCount,places.googleMapsUri,places.photos,places.primaryType,places.types,places.location',
       },
-      body: JSON.stringify({ textQuery: query, maxResultCount: 3, languageCode: 'es' }),
+      body: JSON.stringify(body),
     })
     if (!res.ok) {
       const errText = await res.text()
@@ -98,6 +112,9 @@ async function placesTextSearch(
       placeId: good.id || '',
       primaryType: good.primaryType || null,
       types: good.types || [],
+      location: good.location
+        ? { lat: good.location.latitude, lng: good.location.longitude }
+        : null,
     }
   } catch (e: any) {
     console.error(`[Places] fetch threw for "${query}":`, e.message)
@@ -484,7 +501,8 @@ async function enrichItems(
   kind: 'gastronomia' | 'actividad' | 'alojamiento',
   apiKey: string,
   supaAdmin: SupabaseClient,
-  lodgingCtx?: { checkin: string; checkout: string; adults: number }
+  lodgingCtx?: { checkin: string; checkout: string; adults: number },
+  locationBias?: { lat: number; lng: number; radius: number }
 ): Promise<{ enriched: number; photoed: number }> {
   let enriched = 0
   let photoed = 0
@@ -494,9 +512,9 @@ async function enrichItems(
       if (!item.nombre) return null
       const query = `${item.nombre} ${city}`
       if (kind === 'alojamiento') {
-        return await placesTextSearch(query, apiKey, { requireTypes: LODGING_TYPES })
+        return await placesTextSearch(query, apiKey, { requireTypes: LODGING_TYPES, locationBias })
       }
-      return await placesTextSearch(query, apiKey)
+      return await placesTextSearch(query, apiKey, { locationBias })
     })
   )
 
@@ -659,16 +677,40 @@ export default async function handler(req: any, res: any) {
         checkout: viaje.fecha_fin,
         adults: personas.length,
       }
+
+      // 1) Fetch destination coords so we can locationBias all enrichment
+      //    queries — avoids matches by name that live in another city
+      //    (e.g. "Hotel Roma" in Firenze when destino=Roma).
+      let locationBias: { lat: number; lng: number; radius: number } | undefined
+      try {
+        const destQuery = viaje.pais && !city.toLowerCase().includes(String(viaje.pais).toLowerCase())
+          ? `${city} ${viaje.pais}`
+          : city
+        const destMatch = await placesTextSearch(destQuery, PLACES_KEY!, { strict: false })
+        if (destMatch?.location) {
+          locationBias = {
+            lat: destMatch.location.lat,
+            lng: destMatch.location.lng,
+            radius: 50000, // 50km covers most cities + outskirts
+          }
+          console.log(`[LocationBias] ${city} → ${destMatch.location.lat},${destMatch.location.lng}`)
+        } else {
+          console.warn(`[LocationBias] could not resolve coords for "${destQuery}"`)
+        }
+      } catch (e: any) {
+        console.error('[LocationBias] failed (continuing without bias):', e.message)
+      }
+
       try {
         const [gastroResult, actResult, lodgResult] = await Promise.all([
           Array.isArray(json.gastronomia)
-            ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin)
+            ? enrichItems(json.gastronomia, city, 'gastronomia', PLACES_KEY!, supaAdmin, undefined, locationBias)
             : { enriched: 0, photoed: 0 },
           Array.isArray(json.actividades)
-            ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin)
+            ? enrichItems(json.actividades, city, 'actividad', PLACES_KEY!, supaAdmin, undefined, locationBias)
             : { enriched: 0, photoed: 0 },
           Array.isArray(json.alojamientos)
-            ? enrichItems(json.alojamientos, city, 'alojamiento', PLACES_KEY!, supaAdmin, lodgingCtx)
+            ? enrichItems(json.alojamientos, city, 'alojamiento', PLACES_KEY!, supaAdmin, lodgingCtx, locationBias)
             : { enriched: 0, photoed: 0 },
         ])
         enrichmentSummary = `gastro ${gastroResult.enriched}/6 matched (${gastroResult.photoed} photos); actividades ${actResult.enriched}/6 matched (${actResult.photoed} photos); alojamientos ${lodgResult.enriched}/3 matched (${lodgResult.photoed} photos)`
