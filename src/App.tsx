@@ -761,12 +761,17 @@ function NuevoViajeView({ state, onCreate, onNavigate }: any) {
   )
 }
 
-function ViajeView({ id, state, setState, onNavigate, onDeleteViaje }: any) {
+function ViajeView({ id, state, setState, onNavigate, onDeleteViaje, onReload }: any) {
   const viaje: Viaje | undefined = state.viajes.find((v: Viaje) => v.id === id)
+  const [showGenModal, setShowGenModal] = useState(false)
+  const [generating, setGenerating] = useState(false)
+  const [genError, setGenError] = useState<string | null>(null)
+
   if (!viaje) return <div className="max-w-3xl mx-auto px-6 py-20 text-center" style={{ color: C.muted }}>Viaje no encontrado.</div>
 
   const travelers = viaje.viajeros.map(tid => state.personas.find((p: Persona) => p.id === tid)).filter(Boolean)
   const total = tripTotal(viaje)
+  const isEmpty = viaje.transporte.length === 0 && viaje.alojamientos.length === 0 && viaje.actividades.length === 0 && viaje.gastronomia.length === 0
 
   const updateLocal = (next: Viaje) => setState((s: AppState) => ({ ...s, viajes: s.viajes.map(v => v.id === viaje.id ? next : v) }))
 
@@ -779,6 +784,20 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje }: any) {
     const next = !cur.seleccionado
     updateLocal({ ...viaje, [category]: (viaje as any)[category].map((x: any) => x.id === optionId ? { ...x, seleccionado: next } : x) })
     await db.toggleItem(category, optionId, next)
+  }
+
+  const handleGenerate = async () => {
+    setShowGenModal(false)
+    setGenerating(true)
+    setGenError(null)
+    try {
+      await db.generateProposal(viaje.id)
+      await onReload()
+    } catch (e: any) {
+      setGenError(e.message || 'Error generando propuesta')
+    } finally {
+      setGenerating(false)
+    }
   }
 
   const openAllBookings = () => {
@@ -830,84 +849,95 @@ function ViajeView({ id, state, setState, onNavigate, onDeleteViaje }: any) {
       </div>
 
       <div className="max-w-6xl mx-auto px-6 py-16">
-        {viaje.descripcion_larga && (
-          <div className="max-w-2xl mx-auto text-center mb-20">
-            <div className="tracking-caps mb-3" style={{ color: C.aegean }}>La propuesta</div>
-            <p className="italic-serif text-2xl leading-relaxed" style={{ color: C.inkSoft }}>"{viaje.descripcion_larga}"</p>
-          </div>
+        {isEmpty ? (
+          <EmptyProposal viaje={viaje} travelers={travelers} onGenerate={() => setShowGenModal(true)} error={genError} />
+        ) : (
+          <>
+            {viaje.descripcion_larga && (
+              <div className="max-w-2xl mx-auto text-center mb-20">
+                <div className="tracking-caps mb-3" style={{ color: C.aegean }}>La propuesta</div>
+                <p className="italic-serif text-2xl leading-relaxed" style={{ color: C.inkSoft }}>"{viaje.descripcion_larga}"</p>
+              </div>
+            )}
+
+            <BlockSection num="I" title="Cómo llegamos" subtitle="Vuelos con precios y horarios" icon={Plane}>
+              <div className="space-y-3">
+                {viaje.transporte.map((t, i) => (
+                  <TransporteRow key={t.id} option={t} onSelect={() => onSelectSingle('transporte', t.id)} index={i} />
+                ))}
+              </div>
+            </BlockSection>
+
+            <BlockSection num="II" title="Dónde dormimos" subtitle={`${nightsBetween(viaje.fecha_inicio, viaje.fecha_fin)} noches entre colinas y rooftops`} icon={HomeIcon}>
+              <div className="space-y-6">
+                {viaje.alojamientos.map(a => (
+                  <AlojamientoCard key={a.id} option={a} onSelect={() => onSelectSingle('alojamientos', a.id)} featured={a.seleccionado} />
+                ))}
+              </div>
+            </BlockSection>
+
+            <BlockSection num="III" title="Qué hacemos" subtitle="Iconos y tesoros secretos" icon={Compass}>
+              <div className="grid md:grid-cols-2 gap-5">
+                {viaje.actividades.map(a => (
+                  <ActividadCard key={a.id} option={a} onSelect={() => onToggleItem('actividades', a.id)} />
+                ))}
+              </div>
+            </BlockSection>
+
+            <BlockSection num="IV" title="Dónde comemos" subtitle="Curados al estilo de quienes viajan" icon={Utensils}>
+              <div className="grid md:grid-cols-2 gap-5">
+                {viaje.gastronomia.map(g => (
+                  <GastronomiaCard key={g.id} option={g} onSelect={() => onToggleItem('gastronomia', g.id)} />
+                ))}
+              </div>
+            </BlockSection>
+
+            <div className="mt-20 rounded-3xl p-10 md:p-14" style={{ background: C.ink, color: C.paper }}>
+              <div className="tracking-caps mb-3" style={{ color: C.sand }}>Reservas</div>
+              <h2 className="font-display text-5xl mb-3">Todo listo, <span className="italic-serif" style={{ color: C.sand }}>a un clic.</span></h2>
+              <p className="text-base mb-10 opacity-80 max-w-xl">
+                Estas son las elecciones actuales. Abre los enlaces y ejecuta cada reserva en su plataforma.
+              </p>
+              <div className="grid md:grid-cols-4 gap-4 mb-10">
+                <TotalCell label="Transporte" value={total.transporte} />
+                <TotalCell label="Alojamiento" value={total.alojamiento} />
+                <TotalCell label="Actividades" value={total.actividades} sub={`×${travelers.length || 1}`} />
+                <TotalCell label="Total estimado" value={total.total} highlight />
+              </div>
+              <div className="space-y-2 mb-10">
+                {[...viaje.transporte, ...viaje.alojamientos, ...viaje.actividades]
+                  .filter((x: any) => x.seleccionado && x.deeplink && x.plataforma !== 'Sin reserva')
+                  .map((x: any) => (
+                    <a key={x.id} href={x.deeplink} target="_blank" rel="noreferrer"
+                      className="flex items-center justify-between p-4 rounded-xl hover:bg-white/5 transition-colors"
+                      style={{ border: `1px solid rgba(247,242,233,0.15)` }}>
+                      <div className="flex items-center gap-3 min-w-0">
+                        <ExternalLink size={14} style={{ color: C.sand }} />
+                        <span className="font-serif text-lg truncate">{x.nombre || x.compania}</span>
+                        <span className="text-xs opacity-60">{x.plataforma || x.tipo}</span>
+                      </div>
+                      <ArrowUpRight size={16} className="opacity-60 flex-shrink-0" />
+                    </a>
+                  ))}
+              </div>
+              <button onClick={openAllBookings}
+                className="w-full md:w-auto px-8 h-14 rounded-full flex items-center justify-center gap-2 text-base font-medium"
+                style={{ background: C.paper, color: C.ink }}>
+                <Sparkles size={16} /> Abrir todos los enlaces
+              </button>
+            </div>
+          </>
         )}
-
-        <BlockSection num="I" title="Cómo llegamos" subtitle="Vuelos con precios y horarios" icon={Plane}>
-          <div className="space-y-3">
-            {viaje.transporte.map((t, i) => (
-              <TransporteRow key={t.id} option={t} onSelect={() => onSelectSingle('transporte', t.id)} index={i} />
-            ))}
-          </div>
-        </BlockSection>
-
-        <BlockSection num="II" title="Dónde dormimos" subtitle={`${nightsBetween(viaje.fecha_inicio, viaje.fecha_fin)} noches entre colinas y rooftops`} icon={HomeIcon}>
-          <div className="space-y-6">
-            {viaje.alojamientos.map(a => (
-              <AlojamientoCard key={a.id} option={a} onSelect={() => onSelectSingle('alojamientos', a.id)} featured={a.seleccionado} />
-            ))}
-          </div>
-        </BlockSection>
-
-        <BlockSection num="III" title="Qué hacemos" subtitle="Iconos y tesoros secretos" icon={Compass}>
-          <div className="grid md:grid-cols-2 gap-5">
-            {viaje.actividades.map(a => (
-              <ActividadCard key={a.id} option={a} onSelect={() => onToggleItem('actividades', a.id)} />
-            ))}
-          </div>
-        </BlockSection>
-
-        <BlockSection num="IV" title="Dónde comemos" subtitle="Curados al estilo de quienes viajan" icon={Utensils}>
-          <div className="grid md:grid-cols-2 gap-5">
-            {viaje.gastronomia.map(g => (
-              <GastronomiaCard key={g.id} option={g} onSelect={() => onToggleItem('gastronomia', g.id)} />
-            ))}
-          </div>
-        </BlockSection>
-
-        <div className="mt-20 rounded-3xl p-10 md:p-14" style={{ background: C.ink, color: C.paper }}>
-          <div className="tracking-caps mb-3" style={{ color: C.sand }}>Reservas</div>
-          <h2 className="font-display text-5xl mb-3">Todo listo, <span className="italic-serif" style={{ color: C.sand }}>a un clic.</span></h2>
-          <p className="text-base mb-10 opacity-80 max-w-xl">
-            Estas son las elecciones actuales. Abre los enlaces y ejecuta cada reserva en su plataforma.
-          </p>
-          <div className="grid md:grid-cols-4 gap-4 mb-10">
-            <TotalCell label="Transporte" value={total.transporte} />
-            <TotalCell label="Alojamiento" value={total.alojamiento} />
-            <TotalCell label="Actividades" value={total.actividades} sub={`×${travelers.length || 1}`} />
-            <TotalCell label="Total estimado" value={total.total} highlight />
-          </div>
-          <div className="space-y-2 mb-10">
-            {[...viaje.transporte, ...viaje.alojamientos, ...viaje.actividades]
-              .filter((x: any) => x.seleccionado && x.deeplink && x.plataforma !== 'Sin reserva')
-              .map((x: any) => (
-                <a key={x.id} href={x.deeplink} target="_blank" rel="noreferrer"
-                  className="flex items-center justify-between p-4 rounded-xl hover:bg-white/5 transition-colors"
-                  style={{ border: `1px solid rgba(247,242,233,0.15)` }}>
-                  <div className="flex items-center gap-3 min-w-0">
-                    <ExternalLink size={14} style={{ color: C.sand }} />
-                    <span className="font-serif text-lg truncate">{x.nombre || x.compania}</span>
-                    <span className="text-xs opacity-60">{x.plataforma || x.tipo}</span>
-                  </div>
-                  <ArrowUpRight size={16} className="opacity-60 flex-shrink-0" />
-                </a>
-              ))}
-          </div>
-          <button onClick={openAllBookings}
-            className="w-full md:w-auto px-8 h-14 rounded-full flex items-center justify-center gap-2 text-base font-medium"
-            style={{ background: C.paper, color: C.ink }}>
-            <Sparkles size={16} /> Abrir todos los enlaces
-          </button>
-        </div>
       </div>
+
+      {showGenModal && (
+        <GenerateModal viaje={viaje} travelers={travelers}
+          onCancel={() => setShowGenModal(false)} onConfirm={handleGenerate} />
+      )}
+      {generating && <GeneratingOverlay destino={viaje.destino} />}
     </div>
   )
 }
-
 function BlockSection({ num, title, subtitle, icon: Icon, children }: any) {
   return (
     <section className="mb-20">
@@ -1145,6 +1175,104 @@ function GastronomiaCard({ option, onSelect }: any) {
   )
 }
 
+function EmptyProposal({ viaje, travelers, onGenerate, error }: any) {
+  return (
+    <div className="max-w-2xl mx-auto px-6 py-16 text-center">
+      <div className="tracking-caps mb-6" style={{ color: C.aegean }}>La propuesta aún no existe</div>
+      <h2 className="font-display text-5xl leading-[1.05] mb-8" style={{ color: C.ink }}>
+        Un viaje a <span className="italic-serif" style={{ color: C.aegean }}>{viaje.destino}</span>.
+        <br /><span className="italic-serif" style={{ color: C.muted }}>Por ahora, solo una idea.</span>
+      </h2>
+      <p className="text-lg leading-relaxed mb-10" style={{ color: C.inkSoft }}>
+        Dejá que la IA lea los perfiles de {travelers.map((p: Persona) => p.nombre).join(' y ')} y
+        diseñe una propuesta completa — vuelos, alojamientos, actividades y restaurantes —
+        pensada específicamente para ustedes.
+      </p>
+      {error && (
+        <div className="mb-6 p-4 rounded-xl text-sm text-left mx-auto max-w-md"
+             style={{ background: '#F5DDD4', color: '#7A2E1E' }}>
+          <strong>Algo falló:</strong> {error}
+        </div>
+      )}
+      <button onClick={onGenerate}
+        className="px-8 h-14 rounded-full inline-flex items-center gap-2 text-base btn-primary">
+        <Sparkles size={18} /> Soñar este viaje
+      </button>
+      <p className="text-xs mt-6" style={{ color: C.muted }}>
+        Tarda unos 30 segundos. Podés ajustar todo después.
+      </p>
+    </div>
+  )
+}
+
+function GenerateModal({ viaje, travelers, onCancel, onConfirm }: any) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-6 fade-in"
+         style={{ background: 'rgba(11,30,42,0.6)', backdropFilter: 'blur(8px)' }}
+         onClick={onCancel}>
+      <div className="max-w-md w-full rounded-3xl p-8 slide-up"
+           style={{ background: C.paper }}
+           onClick={e => e.stopPropagation()}>
+        <div className="tracking-caps mb-3" style={{ color: C.aegean }}>Generar con IA</div>
+        <h3 className="font-display text-3xl mb-5 leading-tight" style={{ color: C.ink }}>
+          ¿Soñamos <span className="italic-serif" style={{ color: C.aegean }}>{viaje.destino}</span>?
+        </h3>
+        <p className="mb-2 leading-relaxed" style={{ color: C.inkSoft }}>
+          Voy a generar una propuesta completa para <strong>{viaje.destino}</strong>{' '}
+          del {fmtDateShort(viaje.fecha_inicio)} al {fmtDateShort(viaje.fecha_fin)}{' '}
+          para {travelers.map((p: Persona) => p.nombre).join(' y ')}.
+        </p>
+        <p className="text-sm mb-8" style={{ color: C.muted }}>
+          3 vuelos · 3 alojamientos · 6 actividades · 6 restaurantes. Tarda unos 30 segundos.
+        </p>
+        <div className="flex gap-3">
+          <button onClick={onCancel}
+            className="flex-1 h-11 rounded-full btn-ghost border"
+            style={{ borderColor: C.line }}>
+            Cancelar
+          </button>
+          <button onClick={onConfirm}
+            className="flex-1 h-11 rounded-full btn-primary flex items-center justify-center gap-2">
+            <Sparkles size={14} /> Empezar a soñar
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function GeneratingOverlay({ destino }: { destino: string }) {
+  const phrases = [
+    `Soñando con ${destino}`,
+    `Imaginando los mejores rincones`,
+    `Buscando vuelos y horarios`,
+    `Curando los alojamientos`,
+    `Pensando actividades a medida`,
+    `Seleccionando los restaurantes`,
+    `Cerrando los últimos detalles`
+  ]
+  const [i, setI] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setI(n => (n + 1) % phrases.length), 3500)
+    return () => clearInterval(t)
+  }, [])
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center px-6"
+         style={{ background: 'rgba(11,30,42,0.96)', backdropFilter: 'blur(20px)' }}>
+      <div className="text-center max-w-2xl">
+        <div className="tracking-caps mb-8" style={{ color: C.sand }}>La IA está imaginando</div>
+        <div className="font-display text-[clamp(2.5rem,6vw,5rem)] leading-[1.05] fade-in"
+             key={i}
+             style={{ color: C.paper, fontWeight: 800 }}>
+          <span className="italic-serif">{phrases[i]}</span>
+          <span className="animate-pulse">…</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [session, setSession] = useState<any>(null)
   const [checkingAuth, setCheckingAuth] = useState(true)
@@ -1220,7 +1348,7 @@ export default function App() {
       {view.name === 'personas' && <PersonasListView state={state} onNavigate={setView} />}
       {view.name === 'persona' && <PersonaView id={view.id} state={state} onSave={handleSavePersona} onDelete={handleDeletePersona} onNavigate={setView} />}
       {view.name === 'nuevo' && <NuevoViajeView state={state} onCreate={handleCreateViaje} onNavigate={setView} />}
-      {view.name === 'viaje' && <ViajeView id={view.id} state={state} setState={setState} onNavigate={setView} onDeleteViaje={handleDeleteViaje} />}
+      {view.name === 'viaje' && <ViajeView id={view.id} state={state} setState={setState} onNavigate={setView} onDeleteViaje={handleDeleteViaje} onReload={reload} />}
     </div>
   )
 }

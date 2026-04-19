@@ -74,3 +74,24 @@ export async function toggleItem(table: 'actividades' | 'gastronomia', id: strin
   const { error } = await supabase.from(table).update({ seleccionado: next }).eq('id', id)
   if (error) throw error
 }
+
+export async function generateProposal(viajeId: string): Promise<void> {
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+  if (!session) throw new Error('No hay sesión activa')
+
+  const res = await fetch('/api/generate-proposal', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+    },
+    body: JSON.stringify({ viaje_id: viajeId }),
+  })
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+    throw new Error(err.error || `Error generando propuesta`)
+  }
+}
